@@ -13,25 +13,6 @@ import {
 } from "../../../test/factories/gameStateFactory.ts";
 import { GameLogPanel } from "../GameLogPanel.tsx";
 
-const draggable = vi.hoisted(() => ({ ref: { current: null as HTMLDivElement | null } }));
-
-vi.mock("../../../hooks/useDraggableWidget.ts", () => ({
-  useDraggableWidget: () => ({
-    ref: draggable.ref,
-    style: {},
-    drag: false,
-    dragMomentum: false,
-    dragElastic: 0,
-    onDragStart: vi.fn(),
-    onDragEnd: vi.fn(),
-    onClickCapture: undefined,
-    dragging: false,
-    x: undefined,
-    y: undefined,
-    scale: 1,
-  }),
-}));
-
 function entry(
   seq: number,
   text: string,
@@ -63,6 +44,15 @@ function setScrollMetrics(
   element.scrollTop = scrollTop;
 }
 
+function setViewportWidth(width: number) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+  window.dispatchEvent(new Event("resize"));
+}
+
 function snapshot(seq: number): EngineSnapshot {
   return {
     state: useGameStore.getState().gameState!,
@@ -73,14 +63,19 @@ function snapshot(seq: number): EngineSnapshot {
 
 describe("GameLogPanel", () => {
   beforeEach(() => {
-    draggable.ref.current = null;
+    setViewportWidth(1024);
     useGameStore.getState().reset();
     useGameStore.setState({
       gameState: buildGameState({ waiting_for: buildPriorityWaitingFor() }),
       logHistory: [entry(0, "Initial event")],
     });
-    usePreferencesStore.setState({ logDefaultState: "closed" });
-    useUiStore.setState({ logPanelOpen: true, flexEditMode: false });
+    usePreferencesStore.setState({ logPanelLastChoice: "open", logDockSide: "right" });
+    useUiStore.setState({
+      logPanelOpen: true,
+      flexEditMode: false,
+      inspectedObjectId: null,
+      previewSticky: false,
+    });
   });
 
   afterEach(() => {
@@ -191,6 +186,7 @@ describe("GameLogPanel", () => {
     await user.click(within(log).getByRole("button", { name: "Clear filters" }));
     expect(screen.getByRole("searchbox", { name: "Search game log" })).toHaveValue("");
     expect(screen.getByRole("button", { name: "Life" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "Details" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText("Life event")).toBeInTheDocument();
     expect(log.scrollTop).toBe(40);
   });
@@ -211,13 +207,43 @@ describe("GameLogPanel", () => {
     render(<GameLogPanel />);
 
     await user.click(screen.getByRole("button", { name: "Filters (0)" }));
-    await user.click(screen.getByRole("button", { name: "Turn" }));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Filter by turn" }), "2");
 
-    expect(screen.getByText("T2 · Upkeep")).toBeInTheDocument();
+    expect(screen.getByText("Turn 2 · Upkeep")).toBeInTheDocument();
     expect(screen.queryByText("No matching events")).not.toBeInTheDocument();
   });
 
+  it("keeps an engine-authored active player in a coalesced timeline divider", () => {
+    useGameStore.setState({
+      logHistory: [
+        entry(0, "", {
+          turn: 2,
+          phase: "Untap",
+          category: "Turn",
+          segments: [
+            { type: "Text", value: "Turn " },
+            { type: "Number", value: 2 },
+            { type: "Text", value: " — " },
+            { type: "PlayerName", value: { name: "Chandra", player_id: 1 } },
+          ],
+          presentation: { importance: "Context", tone: "Neutral", boundary: "Turn", visibility: "Public" },
+        }),
+        entry(1, "", {
+          turn: 2,
+          phase: "DeclareAttackers",
+          category: "Turn",
+          presentation: { importance: "Context", tone: "Neutral", boundary: "Phase", visibility: "Public" },
+        }),
+        entry(2, "Balduvian Bears attacks Chandra", { turn: 2, category: "Combat" }),
+      ],
+    });
+    render(<GameLogPanel />);
+
+    expect(screen.getByText(/Turn 2 — Chandra · Declare Attackers/)).toBeInTheDocument();
+  });
+
   it("opens a closed panel when the game ends and can then be dismissed", () => {
+    usePreferencesStore.setState({ logPanelLastChoice: "closed" });
     useUiStore.setState({ logPanelOpen: false });
     render(<GameLogPanel />);
 
@@ -255,16 +281,159 @@ describe("GameLogPanel", () => {
     expect(screen.getByText("AI draws a card")).toBeInTheDocument();
   });
 
-  it("shares the panel node with drag behavior and closes only from outside interaction", () => {
+  it("stays open through outside interaction until explicitly closed", () => {
     render(<GameLogPanel />);
 
     const panel = screen.getByRole("region", { name: "Game log panel" });
-    expect(draggable.ref.current).toBe(panel);
 
     fireEvent.mouseDown(panel);
     expect(useUiStore.getState().logPanelOpen).toBe(true);
     fireEvent.mouseDown(document.body);
+    expect(useUiStore.getState().logPanelOpen).toBe(true);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(useUiStore.getState().logPanelOpen).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close game log" }));
+
     expect(useUiStore.getState().logPanelOpen).toBe(false);
+  });
+
+  it("releases its flex-layout column immediately when closed", () => {
+    render(<GameLogPanel />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close game log" }));
+
+    expect(screen.queryByRole("region", { name: "Game log panel" })).not.toBeInTheDocument();
+  });
+
+  it("seeds the panel open on desktop from the shipped default", () => {
+    // Driven from the store's REAL default rather than a literal "open": with a
+    // literal this test would pass against the pre-change seed effect too and so
+    // would prove nothing about the shipped default. This way it goes red if the
+    // default ever flips back to "closed".
+    usePreferencesStore.setState({
+      logPanelLastChoice: usePreferencesStore.getInitialState().logPanelLastChoice,
+    });
+    useUiStore.setState({ logPanelOpen: false });
+
+    render(<GameLogPanel />);
+
+    expect(screen.getByRole("region", { name: "Game log panel" })).toBeInTheDocument();
+    expect(useUiStore.getState().logPanelOpen).toBe(true);
+  });
+
+  it("never seeds the panel open on a mobile viewport", () => {
+    setViewportWidth(800);
+    usePreferencesStore.setState({ logPanelLastChoice: "open" });
+    useUiStore.setState({ logPanelOpen: false });
+
+    render(<GameLogPanel />);
+
+    expect(screen.queryByRole("region", { name: "Game log panel" })).not.toBeInTheDocument();
+    expect(useUiStore.getState().logPanelOpen).toBe(false);
+  });
+
+  it("a stale open panel from a previous game does not survive into the next", () => {
+    // Exactly the state a previous game's game-over reveal leaves behind: the
+    // non-persisted uiStore still says open while the user's remembered choice
+    // is closed. The seed is authoritative, so it must close the panel.
+    usePreferencesStore.setState({ logPanelLastChoice: "closed" });
+    useUiStore.setState({ logPanelOpen: true });
+
+    render(<GameLogPanel />);
+
+    expect(useUiStore.getState().logPanelOpen).toBe(false);
+  });
+
+  it("re-applies the remembered choice on a rematch without remounting", () => {
+    usePreferencesStore.setState({ logPanelLastChoice: "closed" });
+    useUiStore.setState({ logPanelOpen: false });
+
+    render(<GameLogPanel />);
+
+    // Stand in for the game-over reveal, which opens the panel without the user.
+    act(() => useUiStore.getState().setLogPanelOpen(true));
+    expect(useUiStore.getState().logPanelOpen).toBe(true);
+
+    // A rematch starts a new session in place — the panel never unmounts.
+    act(() => {
+      useGameStore.setState({
+        gameSessionGeneration: useGameStore.getState().gameSessionGeneration + 1,
+      });
+    });
+
+    expect(useUiStore.getState().logPanelOpen).toBe(false);
+  });
+
+  it("does not remember the game-over reveal as a user choice", () => {
+    usePreferencesStore.setState({ logPanelLastChoice: "closed" });
+    useUiStore.setState({ logPanelOpen: false });
+
+    render(<GameLogPanel />);
+
+    act(() => {
+      useGameStore.setState({
+        gameState: buildGameState({ waiting_for: { type: "GameOver", data: { winner: 0 } } }),
+      });
+    });
+
+    expect(useUiStore.getState().logPanelOpen).toBe(true);
+    expect(usePreferencesStore.getState().logPanelLastChoice).toBe("closed");
+  });
+
+  it("remembers the closed choice when the header close button is clicked", () => {
+    render(<GameLogPanel />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close game log" }));
+
+    expect(useUiStore.getState().logPanelOpen).toBe(false);
+    expect(usePreferencesStore.getState().logPanelLastChoice).toBe("closed");
+  });
+
+  it("renders as an in-flow desktop column instead of a fixed drawer", () => {
+    render(<GameLogPanel />);
+
+    const panel = screen.getByRole("region", { name: "Game log panel" });
+    expect(panel).toHaveClass("w-full", "lg:h-full", "lg:w-80", "lg:border-l");
+    expect(panel).not.toHaveClass("fixed", "left-0", "right-0", "z-[60]");
+    expect(screen.queryByRole("button", { name: /dock game log/i })).not.toBeInTheDocument();
+  });
+
+  it("uses a separate bottom row on narrow screens", () => {
+    setViewportWidth(800);
+    usePreferencesStore.setState({ logDockSide: "left" });
+
+    render(<GameLogPanel />);
+    // The session seed closes the panel on this mobile viewport. AnimatePresence
+    // would keep the exiting node queryable, so asserting on it would be green by
+    // accident; reopen explicitly so the assertions read a settled panel.
+    act(() => {
+      useUiStore.getState().setLogPanelOpen(true);
+    });
+
+    const panel = screen.getByRole("region", { name: "Game log panel" });
+    expect(panel).toHaveClass("h-[min(50dvh,28rem)]", "w-full", "border-t");
+    expect(panel).not.toHaveClass("fixed", "right-0", "left-0");
+    expect(screen.queryByRole("button", { name: /dock game log/i })).not.toBeInTheDocument();
+  });
+
+  it("opens a sticky preview when a card-name link is clicked", () => {
+    useGameStore.setState({
+      logHistory: [
+        entry(0, "", {
+          segments: [{ type: "CardName", value: { object_id: 42, name: "Pithing Needle" } }],
+        }),
+      ],
+    });
+    render(<GameLogPanel />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Pithing Needle" }));
+
+    expect(useUiStore.getState()).toMatchObject({
+      inspectedObjectId: 42,
+      inspectedCardName: "Pithing Needle",
+      previewSticky: true,
+    });
   });
 
   it("copies filtered entries with their translated context and announces success", async () => {

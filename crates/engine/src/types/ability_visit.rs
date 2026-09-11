@@ -11,14 +11,28 @@
 //! that owns the answer.
 //!
 //! That guarantee is necessary but not sufficient. A new nested **struct field**
-//! is field access, not a match arm, so it compiles silently. Two fixtures are
+//! is field access, not a match arm, so it compiles silently. Three fixtures are
 //! the complementary safety nets:
 //!
 //! - `game::printed_cards::tests::walker_covers_every_nested_carrier`
 //! - `ai_support::targeted_exchange::tests::predicate_sees_a_fight_in_every_nested_carrier`
+//! - `parser::oracle::tests::render_net_reaches_every_nested_description_carrier`
 //!
-//! Both plant a marker effect in every carrier this module descends into.
-//! Extend **both** whenever a carrier is added.
+//! Each plants a marker in every carrier its walker descends into.
+//! Extend **all three** whenever a carrier is added.
+//!
+//! The third belongs to a **`description`-shaped** walker
+//! (`parser::oracle::render_effect_descriptions`, the CR 201.5a display-render
+//! net), not an `Effect`-shaped one, and at the `Effect`-ARM level its descend
+//! set is a strict SUPERSET of this module's: it also descends `Effect::Mana`,
+//! `GrantCastingPermission`, `ExileResolvingSpellInsteadOfGraveyard`,
+//! `CreateDelayedTrigger.condition`, the copy family,
+//! `AddPendingEntersModifications`, `EachPlayerCopyChosen`, and `ReturnAsAura`,
+//! all leaves here. So a carrier added there is not necessarily a carrier here,
+//! but a carrier added here is always one there. The superset relation does NOT
+//! extend one level down: this module descends
+//! `ContinuousModification::CopyValues` into `visit_copiable_values_scoped` and
+//! that net deliberately does not (`CopyValues` is parse-unreachable).
 //!
 //! Two narrower ad-hoc walkers remain unmigrated and are candidate future
 //! consumers: `game::coverage::ability_tree_any` (which has a `_ => {}`
@@ -99,14 +113,19 @@ pub enum ResolutionScope {
 /// ([`visit_nested_ability_def_scoped`]) and the cost walk
 /// ([`visit_ability_def_costs_scoped`]) consult this and nothing else.
 ///
-/// Deliberately keys on `WhenYouDo` ALONE. `AbilityCondition::EffectOutcome`
-/// ("if you do, ...") is CR 608.2c — one instruction conditional on another
-/// within the SAME resolution — and must keep being descended. Do not reach for
-/// `effects::sub_ability_is_reflexive`, which unions the two because it answers a
-/// different question (skip-on-decline), not this one.
+/// Deliberately keys on the root `WhenYouDo` marker alone. Its optional flat
+/// `And` guard is still part of the separately-created reflexive ability.
+/// `AbilityCondition::EffectOutcome` ("if you do, ...") is CR 608.2c — one
+/// instruction conditional on another within the SAME resolution — and must
+/// keep being descended. Do not reach for `effects::sub_ability_is_reflexive`,
+/// which unions the two because it answers a different question
+/// (skip-on-decline), not this one.
 fn scope_prunes_nested_ability(def: &AbilityDefinition, scope: ResolutionScope) -> bool {
     scope == ResolutionScope::OwnResolutionOnly
-        && matches!(def.condition, Some(AbilityCondition::WhenYouDo))
+        && def
+            .condition
+            .as_ref()
+            .is_some_and(AbilityCondition::has_when_you_do_marker)
 }
 
 /// Scope-reset trapdoor tripwire, shared by the five traversal functions that
@@ -888,6 +907,10 @@ where
         | Effect::FlipPermanent { .. }
         | Effect::SearchLibrary { .. }
         | Effect::SearchOutsideGame { .. }
+        // CR 400.11b: brings cards in from outside the game; carries no nested
+        // ability and no statically-named card (the pack is generated at
+        // resolution), so there is nothing for the conjure walker to seed.
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::Reveal { .. }
         | Effect::RevealTop { .. }

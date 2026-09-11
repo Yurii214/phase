@@ -17,13 +17,18 @@ import {
   createDraftPeerSession,
   type DraftPeerSession,
 } from "../network/draftPeerSession";
-import { parseRoomCode } from "../network/connection";
+import {
+  PEER_CONNECT_OPTIONS,
+  RECONNECT_DIAL_TIMEOUT_MS,
+  parseRoomCode,
+} from "../network/connection";
 import {
   deckSubmissionFingerprint,
   DRAFT_PROTOCOL_VERSION,
   type DraftReconnectRejectionKind,
 } from "../network/draftProtocol";
 import type {
+  DraftCommanderLaunch,
   DraftMatchLaunch,
   DraftMatchSettlement,
   DraftP2PMessage,
@@ -41,12 +46,17 @@ import type {
   DraftIntergameCommand,
   DraftIntergameCommandAck,
 } from "../services/intergameCommandLedger";
+import {
+  validateWorkspaceState,
+  type DraftWorkspaceState,
+} from "../components/draft/workspace/types";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
 export type DraftGuestEvent =
   | { type: "joined"; seatIndex: number; draftCode: string }
   | { type: "reconnected"; seatIndex: number }
+  | { type: "workspaceRestored"; workspaceState: DraftWorkspaceState | null }
   | { type: "viewUpdated"; view: DraftPlayerView }
   | { type: "pickAcknowledged"; view: DraftPlayerView }
   | { type: "deckSubmissionAcknowledged"; submissionId: string; view: DraftPlayerView }
@@ -58,6 +68,7 @@ export type DraftGuestEvent =
   | { type: "matchSettlementAcknowledged"; matchId: string; receiptId: string; revision: number }
   | { type: "timerSync"; remainingMs: number }
   | { type: "matchStart"; launch: DraftMatchLaunch }
+  | { type: "commanderLaunch"; launch: DraftCommanderLaunch }
   | { type: "bo3SideboardPrompt"; matchId: string; gameNumber: number; score: { p0_wins: number; p1_wins: number; draws: number }; loserSeat: number | null; timerMs: number }
   | { type: "bo3ChoosePlayDraw"; matchId: string; gameNumber: number; score: { p0_wins: number; p1_wins: number; draws: number }; timerMs: number }
   | { type: "bo3GameStart"; matchId: string; gameNumber: number; firstPlayerSeat: number }
@@ -97,7 +108,15 @@ type DraftGuestEventListener = (event: DraftGuestEvent) => void;
 
 const RECONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000];
 const RECONNECT_STEADY_STATE_MS = 60_000;
+/**
+ * Budget for the *post-open* application handshake — the wait for the host's
+ * `draft_welcome` / `draft_reconnect_ack` after `attachSession` on an already
+ * open, ordered channel. Its cost is one application round trip, so it is not
+ * ICE-sensitive and stays at 10s. The reconnect *dial* budget is a different
+ * quantity and lives in `RECONNECT_DIAL_TIMEOUT_MS`.
+ */
 const FIRST_CONTACT_TIMEOUT_MS = 10_000;
+const LEAVE_ACK_TIMEOUT_MS = 10_000;
 
 function reconnectFailureForRejection(
   kind: DraftReconnectRejectionKind,
@@ -130,16 +149,43 @@ export class P2PDraftGuest {
   private draftCode: string | null = null;
   private seatIndex: number | null = null;
   private terminated = false;
+  /**
+   * A host may explicitly revoke the persisted capability (kick, terminal
+   * host shutdown, or an acknowledged leave).  This is intentionally
+   * narrower than `terminated`: a protocol mismatch is terminal for this
+   * transport attempt but should retain recovery for a refreshed client.
+   */
+  private recoveryRevoked = false;
   private currentView: DraftPlayerView | null = null;
   private handshake: DraftHandshake | null = null;
   private reconnecting = false;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private deckSubmissionWaiters = new Map<
     string,
-    { acknowledgement: Promise<void>; resolve: () => void; reject: (error: Error) => void }
+    {
+      acknowledgement: Promise<void>;
+      resolve: () => void;
+      reject: (error: Error) => void;
+      activeAttempts: number;
+    }
+  >();
+  private landSuggestionWaiters = new Map<
+    string,
+    {
+      session: DraftPeerSession;
+      resolve: (lands: Record<string, number>) => void;
+      reject: (error: Error) => void;
+    }
   >();
   /** Set synchronously so two UI clicks share one outbox command. */
   private pendingDeckSubmission: Promise<void> | null = null;
+  private pendingLeave: Promise<void> | null = null;
+  private leaveAcknowledgement: {
+    session: DraftPeerSession;
+    draftToken: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  } | null = null;
 
   constructor(
     private readonly guestPeer: Peer,
@@ -204,7 +250,7 @@ export class P2PDraftGuest {
     session.onMessage((msg) => {
       // A timed-out or superseded connection must never promote a later
       // reconnect attempt with its delayed acknowledgement.
-      if (this.session === session) void this.handleHostMessage(msg, session);
+      if (this.session === session) return this.handleHostMessage(msg, session);
     });
     return session;
   }
@@ -268,24 +314,31 @@ export class P2PDraftGuest {
 
   private retireSession(session: DraftPeerSession): void {
     if (this.session === session) this.session = null;
+    this.failLandSuggestionWaiters("Draft connection retired", session);
     session.close("Draft reconnect attempt retired");
   }
 
   private handleSessionEnd(session: DraftPeerSession): void {
     if (this.session !== session) return;
     this.session = null;
+    this.failLandSuggestionWaiters("Draft host disconnected", session);
     if (this.handshake?.session === session) {
       this.rejectHandshake(session, new Error("Draft host disconnected before acknowledging"));
     } else {
+      if (this.leaveAcknowledgement?.session === session) {
+        this.leaveAcknowledgement.reject(new Error("Draft host disconnected before acknowledging leave"));
+        this.leaveAcknowledgement = null;
+      }
       this.handleHostDisconnect();
     }
   }
 
   // ── Actions ────────────────────────────────────────────────────────
 
-  async submitPick(cardInstanceId: string): Promise<void> {
+  /** Submit one whole CR 903.13b pick step — every card this seat drafts now. */
+  async submitPick(cardInstanceIds: string[]): Promise<void> {
     if (!this.session) throw new Error("Not connected to draft host");
-    await this.session.send({ type: "draft_pick", cardInstanceId });
+    await this.session.send({ type: "draft_pick", cardInstanceIds });
   }
 
   async submitPickWithDraftEffect(
@@ -300,9 +353,24 @@ export class P2PDraftGuest {
     });
   }
 
-  submitDeck(mainDeck: string[]): Promise<void> {
+  suggestLands(): Promise<Record<string, number>> {
+    const session = this.session;
+    if (!session) return Promise.reject(new Error("Not connected to draft host"));
+    const requestId = crypto.randomUUID();
+    return new Promise<Record<string, number>>((resolve, reject) => {
+      this.landSuggestionWaiters.set(requestId, { session, resolve, reject });
+      void session.send({ type: "draft_suggest_lands", requestId }).catch((error: unknown) => {
+        const waiter = this.landSuggestionWaiters.get(requestId);
+        if (!waiter || waiter.session !== session) return;
+        this.landSuggestionWaiters.delete(requestId);
+        waiter.reject(asError(error));
+      });
+    });
+  }
+
+  submitDeck(mainDeck: string[], commanders: string[]): Promise<void> {
     if (this.pendingDeckSubmission) return this.pendingDeckSubmission;
-    const submission = this.submitDeckInner(mainDeck);
+    const submission = this.submitDeckInner(mainDeck, commanders);
     this.pendingDeckSubmission = submission;
     void submission.then(
       () => {
@@ -315,29 +383,40 @@ export class P2PDraftGuest {
     return submission;
   }
 
-  private async submitDeckInner(mainDeck: string[]): Promise<void> {
+  private async submitDeckInner(mainDeck: string[], commanders: string[]): Promise<void> {
     const identity = this.deckSubmissionIdentity();
     if (!identity) throw new Error("Draft identity is unavailable");
     const existing = await loadDraftDeckSubmission(this.hostPeerId, identity);
+    // CR 903.3: the designation is part of the payload's identity, not a
+    // decoration on it. Fingerprinting `mainDeck` alone would let a resubmit
+    // that changes only the commander read as "same payload" and silently
+    // replay the STORED designation, discarding the player's change.
     const samePayload = existing !== null
-      && deckSubmissionFingerprint(existing.mainDeck) === deckSubmissionFingerprint(mainDeck);
+      && deckSubmissionFingerprint(existing.mainDeck) === deckSubmissionFingerprint(mainDeck)
+      && deckSubmissionFingerprint(existing.commanders) === deckSubmissionFingerprint(commanders);
     if (existing && !samePayload) {
       throw new Error("A deck submission is still awaiting host confirmation");
     }
     const submissionId = existing?.submissionId ?? crypto.randomUUID();
     const payload = existing?.mainDeck ?? mainDeck;
+    const designation = existing?.commanders ?? commanders;
     if (!existing) {
       await saveDraftDeckSubmission(this.hostPeerId, {
         ...identity,
         draftCode: this.draftCode!,
         submissionId,
         mainDeck: payload,
+        commanders: designation,
       });
     }
-    await this.sendDeckSubmission(submissionId, payload);
+    await this.sendDeckSubmission(submissionId, payload, designation);
   }
 
-  private async sendDeckSubmission(submissionId: string, mainDeck: string[]): Promise<void> {
+  private async sendDeckSubmission(
+    submissionId: string,
+    mainDeck: string[],
+    commanders: string[],
+  ): Promise<void> {
     if (!this.session) throw new Error("Not connected to draft host");
     let waiter = this.deckSubmissionWaiters.get(submissionId);
     if (!waiter) {
@@ -347,14 +426,20 @@ export class P2PDraftGuest {
         resolve = resolvePromise;
         reject = rejectPromise;
       });
-      waiter = { acknowledgement, resolve, reject };
+      waiter = { acknowledgement, resolve, reject, activeAttempts: 0 };
       this.deckSubmissionWaiters.set(submissionId, waiter);
     }
+    waiter.activeAttempts += 1;
     try {
-      await this.session.send({ type: "draft_submit_deck", submissionId, mainDeck });
-      await waiter.acknowledgement;
+      // Observe the receipt even if the session closes while encoding the send.
+      await Promise.all([
+        this.session.send({ type: "draft_submit_deck", submissionId, mainDeck, commanders }),
+        waiter.acknowledgement,
+      ]);
     } finally {
-      if (this.deckSubmissionWaiters.get(submissionId) === waiter) {
+      // A failed replay must not remove the receipt route used by other attempts.
+      waiter.activeAttempts -= 1;
+      if (waiter.activeAttempts === 0 && this.deckSubmissionWaiters.get(submissionId) === waiter) {
         this.deckSubmissionWaiters.delete(submissionId);
       }
     }
@@ -367,6 +452,14 @@ export class P2PDraftGuest {
     this.deckSubmissionWaiters.clear();
   }
 
+  private failLandSuggestionWaiters(reason: string, session?: DraftPeerSession): void {
+    for (const [requestId, waiter] of this.landSuggestionWaiters) {
+      if (session && waiter.session !== session) continue;
+      this.landSuggestionWaiters.delete(requestId);
+      waiter.reject(new Error(reason));
+    }
+  }
+
   /** A reconnect makes the participant-owned command eligible for replay. */
   private async replayDeckSubmission(): Promise<void> {
     const identity = this.deckSubmissionIdentity();
@@ -375,7 +468,7 @@ export class P2PDraftGuest {
     if (!pending || !this.session) return;
     // Do not await here: the reconnect handshake must finish before normal
     // state consumers run, while its durable submission can wait for its ack.
-    void this.sendDeckSubmission(pending.submissionId, pending.mainDeck)
+    void this.sendDeckSubmission(pending.submissionId, pending.mainDeck, pending.commanders)
       .catch((error: unknown) => this.emit({
         type: "error",
         message: error instanceof Error ? error.message : String(error),
@@ -386,6 +479,13 @@ export class P2PDraftGuest {
     const roomCode = parseRoomCode(this.connection.roomCode);
     if (!this.draftCode || !this.draftToken || !roomCode) return null;
     return { roomCode, draftToken: this.draftToken };
+  }
+
+  async updateWorkspace(state: DraftWorkspaceState): Promise<void> {
+    const validated = validateWorkspaceState(state);
+    if ("error" in validated) throw new Error(validated.error);
+    if (!this.session) throw new Error("Not connected to draft host");
+    await this.session.send({ type: "draft_workspace_update", workspaceState: validated });
   }
 
   sendMatchSettlement(settlement: DraftMatchSettlement): void {
@@ -452,7 +552,10 @@ export class P2PDraftGuest {
           break;
         }
 
+        // Persistence can outlive a disconnected or retired handshake.
+        if (this.session !== session) return;
         this.resolveHandshake(session);
+        this.emit({ type: "workspaceRestored", workspaceState: msg.workspaceState });
         this.emit({ type: "joined", seatIndex: msg.seatIndex, draftCode: msg.draftCode });
         this.emit({ type: "viewUpdated", view: msg.view });
         void this.replayDeckSubmission();
@@ -478,7 +581,9 @@ export class P2PDraftGuest {
           }
         }
 
+        if (this.session !== session) return;
         this.resolveHandshake(session);
+        this.emit({ type: "workspaceRestored", workspaceState: msg.workspaceState });
         this.emit({ type: "reconnected", seatIndex: msg.seatIndex });
         this.emit({ type: "viewUpdated", view: msg.view });
         void this.replayDeckSubmission();
@@ -489,8 +594,7 @@ export class P2PDraftGuest {
         this.rejectHandshake(session, new Error(msg.reason));
         if (msg.kind === "Kicked" || msg.kind === "UnknownToken") {
           this.terminated = true;
-          void clearDraftGuestRecovery(this.hostPeerId);
-          void clearDraftDeckSubmission(this.hostPeerId);
+          await this.revokeRecovery();
         } else if (msg.kind === "ProtocolMismatch") {
           // Refresh can restore compatibility, so retain credentials, but a
           // version mismatch cannot be repaired by transport retries.
@@ -500,6 +604,11 @@ export class P2PDraftGuest {
           type: "reconnectFailed",
           failure: reconnectFailureForRejection(msg.kind, msg.reason),
         });
+        break;
+      }
+
+      case "draft_leave_ack": {
+        this.resolveLeaveAcknowledgement(session, msg.draftToken);
         break;
       }
 
@@ -519,8 +628,27 @@ export class P2PDraftGuest {
         this.currentView = msg.view;
         await clearDraftDeckSubmission(this.hostPeerId, msg.submissionId);
         this.deckSubmissionWaiters.get(msg.submissionId)?.resolve();
+        // The durable receipt settles its caller even if the session closed,
+        // but its old view must not be published into a reconnect attempt.
+        if (this.session !== session) return;
         this.emit({ type: "deckSubmissionAcknowledged", submissionId: msg.submissionId, view: msg.view });
         this.emit({ type: "viewUpdated", view: msg.view });
+        break;
+      }
+
+      case "draft_suggest_lands_result": {
+        const waiter = this.landSuggestionWaiters.get(msg.requestId);
+        if (!waiter || waiter.session !== session) break;
+        this.landSuggestionWaiters.delete(msg.requestId);
+        waiter.resolve(msg.lands);
+        break;
+      }
+
+      case "draft_suggest_lands_rejected": {
+        const waiter = this.landSuggestionWaiters.get(msg.requestId);
+        if (!waiter || waiter.session !== session) break;
+        this.landSuggestionWaiters.delete(msg.requestId);
+        waiter.reject(new Error(msg.reason));
         break;
       }
 
@@ -540,9 +668,10 @@ export class P2PDraftGuest {
 
       case "draft_kicked": {
         this.terminated = true;
-        void clearDraftGuestRecovery(this.hostPeerId);
-        void clearDraftDeckSubmission(this.hostPeerId);
+        this.resolveLeaveAcknowledgement(session);
+        await this.revokeRecovery();
         this.failDeckSubmissionWaiters(msg.reason);
+        this.failLandSuggestionWaiters(msg.reason, session);
         this.emit({ type: "kicked", reason: msg.reason });
         break;
       }
@@ -611,9 +740,17 @@ export class P2PDraftGuest {
         break;
       }
 
+      case "draft_commander_launch": {
+        this.emit({ type: "commanderLaunch", launch: msg.launch });
+        break;
+      }
+
       case "draft_host_left": {
         this.terminated = true;
+        this.resolveLeaveAcknowledgement(session);
+        await this.revokeRecovery();
         this.failDeckSubmissionWaiters(msg.reason);
+        this.failLandSuggestionWaiters(msg.reason, session);
         this.emit({ type: "hostLeft", reason: msg.reason });
         break;
       }
@@ -678,7 +815,7 @@ export class P2PDraftGuest {
   // ── Disconnect / Reconnect ─────────────────────────────────────────
 
   private handleHostDisconnect(): void {
-    if (this.terminated || this.reconnecting || !this.draftToken) return;
+    if (this.terminated || this.reconnecting || this.leaveAcknowledgement || !this.draftToken) return;
     this.reconnecting = true;
     void this.attemptReconnect(0);
   }
@@ -708,6 +845,7 @@ export class P2PDraftGuest {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     this.failDeckSubmissionWaiters("Draft connection disposed");
+    this.failLandSuggestionWaiters("Draft connection disposed");
     if (this.handshake) this.rejectHandshake(this.handshake.session, abortError());
     if (this.session) {
       this.retireSession(this.session);
@@ -717,14 +855,64 @@ export class P2PDraftGuest {
     this.listeners = [];
   }
 
-  async leave(): Promise<void> {
+  leave(): Promise<void> {
+    if (this.pendingLeave) return this.pendingLeave;
+    const leave = this.leaveInner();
+    this.pendingLeave = leave;
+    void leave.finally(() => {
+      if (this.pendingLeave === leave) this.pendingLeave = null;
+    }).catch(() => undefined);
+    return leave;
+  }
+
+  private async leaveInner(): Promise<void> {
+    const session = this.session;
+    const draftToken = this.draftToken;
+    if (!session || !draftToken) throw new Error("Draft leave requires an active session");
+
+    const acknowledgement = new Promise<void>((resolve, reject) => {
+      this.leaveAcknowledgement = { session, draftToken, resolve, reject };
+    });
+    const timeout = setTimeout(() => {
+      if (this.leaveAcknowledgement?.session === session) {
+        this.leaveAcknowledgement.reject(new Error("Draft host did not acknowledge leave"));
+        this.leaveAcknowledgement = null;
+      }
+    }, LEAVE_ACK_TIMEOUT_MS);
+
+    try {
+      // Disconnect can reject the acknowledgement before encoding completes.
+      await Promise.all([
+        session.send({
+          type: "draft_leave",
+          draftProtocolVersion: DRAFT_PROTOCOL_VERSION,
+          draftToken,
+        }),
+        acknowledgement,
+      ]);
+    } finally {
+      clearTimeout(timeout);
+      if (this.leaveAcknowledgement?.session === session) this.leaveAcknowledgement = null;
+    }
+
     this.terminated = true;
-    await clearDraftGuestRecovery(this.hostPeerId);
-    await clearDraftDeckSubmission(this.hostPeerId);
+    await this.revokeRecovery();
     this.dispose();
     try {
       this.guestPeer.destroy();
     } catch { /* best-effort */ }
+  }
+
+  private resolveLeaveAcknowledgement(session: DraftPeerSession, draftToken?: string): void {
+    const pending = this.leaveAcknowledgement;
+    if (
+      pending
+      && pending.session === session
+      && (!draftToken || pending.draftToken === draftToken)
+    ) {
+      this.leaveAcknowledgement = null;
+      pending.resolve();
+    }
   }
 
   // ── Accessors ──────────────────────────────────────────────────────
@@ -739,6 +927,19 @@ export class P2PDraftGuest {
 
   get token(): string | null {
     return this.draftToken;
+  }
+
+  /** Whether the host has durably revoked this guest's reconnect capability. */
+  get isRecoveryRevoked(): boolean {
+    return this.recoveryRevoked;
+  }
+
+  private async revokeRecovery(): Promise<void> {
+    await Promise.allSettled([
+      clearDraftGuestRecovery(this.hostPeerId),
+      clearDraftDeckSubmission(this.hostPeerId),
+    ]);
+    this.recoveryRevoked = true;
   }
 
   private async persistRecoveryIdentity(data: { draftToken: string; seatIndex: number; draftCode: string }): Promise<void> {
@@ -777,9 +978,15 @@ export class P2PDraftGuest {
 
   private openReconnectConnection(signal?: AbortSignal): Promise<DataConnection> {
     if (signal?.aborted) return Promise.reject(abortError());
-    const conn = this.guestPeer.connect(this.hostPeerId);
+    // Ordered delivery is not the default: without `reliable: true` PeerJS
+    // builds this channel with `ordered: false`, which a TURN relay will
+    // actually exercise.
+    const conn = this.guestPeer.connect(this.hostPeerId, PEER_CONNECT_OPTIONS);
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => finish(() => reject(new Error("connect timed out"))), FIRST_CONTACT_TIMEOUT_MS);
+      const timeout = setTimeout(
+        () => finish(() => reject(new Error("connect timed out"))),
+        RECONNECT_DIAL_TIMEOUT_MS,
+      );
       const onAbort = () => finish(() => reject(abortError()));
       const onOpen = () => finish(() => resolve(conn));
       const onError = (err: Error) => finish(() => reject(err));

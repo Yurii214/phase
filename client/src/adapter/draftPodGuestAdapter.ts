@@ -17,9 +17,15 @@ import {
   type DraftGuestEvent,
   type DraftGuestRecoveryFailure,
 } from "./p2p-draft-guest";
-import type { DraftMatchLaunch, DraftMatchSettlement, DraftPauseReason } from "../network/draftProtocol";
+import type {
+  DraftCommanderLaunch,
+  DraftMatchLaunch,
+  DraftMatchSettlement,
+  DraftPauseReason,
+} from "../network/draftProtocol";
 import type { DraftIntergameCommand, DraftIntergameCommandAck } from "../services/intergameCommandLedger";
 import { joinRoom, type JoinResult } from "../network/connection";
+import type { DraftWorkspaceState } from "../components/draft/workspace/types";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -39,6 +45,7 @@ export type DraftPodGuestEvent =
   | { type: "statusChanged"; status: DraftPodGuestStatus }
   | { type: "joined"; seatIndex: number; draftCode: string }
   | { type: "reconnected"; seatIndex: number }
+  | { type: "workspaceRestored"; workspaceState: DraftWorkspaceState | null }
   | { type: "viewUpdated"; view: DraftPlayerView }
   | { type: "pickAcknowledged"; view: DraftPlayerView }
   | { type: "deckSubmissionAcknowledged"; submissionId: string; view: DraftPlayerView }
@@ -57,6 +64,7 @@ export type DraftPodGuestEvent =
   | { type: "matchSettlementAcknowledged"; matchId: string; receiptId: string; revision: number }
   | { type: "timerSync"; remainingMs: number }
   | { type: "matchStart"; launch: DraftMatchLaunch }
+  | { type: "commanderLaunch"; launch: DraftCommanderLaunch }
   | { type: "bo3SideboardPrompt"; matchId: string; gameNumber: number; score: { p0_wins: number; p1_wins: number; draws: number }; loserSeat: number | null; timerMs: number }
   | { type: "bo3ChoosePlayDraw"; matchId: string; gameNumber: number; score: { p0_wins: number; p1_wins: number; draws: number }; timerMs: number }
   | { type: "bo3GameStart"; matchId: string; gameNumber: number; firstPlayerSeat: number }
@@ -261,6 +269,9 @@ export class DraftPodGuestAdapter {
         this._seatIndex = event.seatIndex;
         this.emit({ type: "reconnected", seatIndex: event.seatIndex });
         break;
+      case "workspaceRestored":
+        this.emit({ type: "workspaceRestored", workspaceState: event.workspaceState });
+        break;
       case "viewUpdated":
         this._currentView = event.view;
         this.updateStatusFromView(event.view);
@@ -326,6 +337,12 @@ export class DraftPodGuestAdapter {
           type: "matchStart",
           launch: event.launch,
         });
+        break;
+      // A PURE re-emit, deliberately unlike `matchStart` above: a Commander
+      // launch does not change pod phase. The pod stays `complete`, which is
+      // the view the guest's join affordance is rendered from.
+      case "commanderLaunch":
+        this.emit({ type: "commanderLaunch", launch: event.launch });
         break;
       case "kicked":
         this.setStatus("kicked");
@@ -415,9 +432,9 @@ export class DraftPodGuestAdapter {
 
   // ── Draft actions ──────────────────────────────────────────────────
 
-  async submitPick(cardInstanceId: string): Promise<void> {
+  async submitPick(cardInstanceIds: string[]): Promise<void> {
     if (!this.guest) throw new Error("Guest not initialized");
-    await this.guest.submitPick(cardInstanceId);
+    await this.guest.submitPick(cardInstanceIds);
   }
 
   async submitPickWithDraftEffect(
@@ -428,9 +445,19 @@ export class DraftPodGuestAdapter {
     await this.guest.submitPickWithDraftEffect(effectCardInstanceId, cardInstanceIds);
   }
 
-  async submitDeck(mainDeck: string[]): Promise<void> {
+  async submitDeck(mainDeck: string[], commanders: string[]): Promise<void> {
     if (!this.guest) throw new Error("Guest not initialized");
-    await this.guest.submitDeck(mainDeck);
+    await this.guest.submitDeck(mainDeck, commanders);
+  }
+
+  async updateWorkspace(state: DraftWorkspaceState): Promise<void> {
+    if (!this.guest) throw new Error("Guest not initialized");
+    await this.guest.updateWorkspace(state);
+  }
+
+  async suggestLands(): Promise<Record<string, number>> {
+    if (!this.guest) throw new Error("Guest not initialized");
+    return this.guest.suggestLands();
   }
 
   sendMatchSettlement(settlement: DraftMatchSettlement): void {
@@ -461,17 +488,21 @@ export class DraftPodGuestAdapter {
    * explicit participant leave is allowed to revoke durable guest recovery.
    */
   async dispose({ preserveRecovery = true }: { preserveRecovery?: boolean } = {}): Promise<void> {
-    if (this.guestEventUnsub) {
-      this.guestEventUnsub();
-      this.guestEventUnsub = null;
-    }
     if (this.guest) {
       if (preserveRecovery) {
+        this.guest.dispose();
+      } else if (this.guest.isRecoveryRevoked) {
+        // Terminal host events already removed the capability, so there is
+        // no live participant session left to acknowledge another leave.
         this.guest.dispose();
       } else {
         await this.guest.leave();
       }
       this.guest = null;
+    }
+    if (this.guestEventUnsub) {
+      this.guestEventUnsub();
+      this.guestEventUnsub = null;
     }
     if (this.joinResult) {
       this.joinResult.destroyPeer();

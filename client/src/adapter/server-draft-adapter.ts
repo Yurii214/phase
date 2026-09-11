@@ -1,4 +1,5 @@
 import type {
+  AbilityBlockEntry,
   EngineAdapter,
   EngineSnapshot,
   GameAction,
@@ -12,13 +13,18 @@ import type {
   PlayerId,
   SubmitResult,
 } from "./types";
-import type { InteractionSubmission } from "./generated/interaction";
-import { actionRejectionError, AdapterError, AdapterErrorCode, EMPTY_LEGAL_ACTIONS, nextSnapshotSeq } from "./types";
+import type {
+  InteractionPreview,
+  InteractionPreviewRequest,
+  InteractionSubmission,
+} from "./generated/interaction";
+import { actionRejectionError, AdapterError, AdapterErrorCode, EMPTY_LEGAL_ACTIONS, isActionRejection, nextSnapshotSeq } from "./types";
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import {
   HandshakeError,
   openPhaseSocket,
   type PhaseSocket,
+  type PhaseSocketTransport,
 } from "../services/openPhaseSocket";
 import { isValidWebSocketUrl } from "../services/serverDetection";
 import type {
@@ -28,7 +34,7 @@ import type {
   PodPolicy,
   DraftKind,
 } from "./draft-adapter";
-import type { ServerInfo } from "./ws-adapter";
+import type { FullSessionKey, ServerInfo } from "./ws-adapter";
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -40,10 +46,28 @@ export type DraftPhase =
   | "between_rounds"
   | "complete";
 
+/**
+ * Client intent for a server-hosted set draft. This is intentionally not the
+ * persisted engine `DraftSource`: a Chaos request names candidate sets only,
+ * and the native server privately resolves its per-seat pack assignments.
+ */
+export type DraftSourceIntent =
+  | { type: "Uniform"; data: { set_codes: string[] } }
+  | { type: "Chaos"; data: { candidate_codes: string[] } };
+
 /** Settings for creating a new server-hosted draft pod. */
 export interface CreateDraftSettings {
   displayName: string;
-  setCode: string;
+  /**
+   * The set filling each booster, in pack order. One entry per pack the pod
+   * opens; the same set may fill several, and a one-element list fills every
+   * booster (the server repeats the last entry). Mirrors the wire field
+   * Legacy UI input for a Uniform source. New callers may pass `source`
+   * directly; the adapter always serializes the tagged source boundary.
+   */
+  setCodes?: string[];
+  /** Canonical server source intent. Never contains Chaos assignments. */
+  source?: DraftSourceIntent;
   kind: Exclude<DraftKind, "Quick">;
   public: boolean;
   password?: string;
@@ -51,6 +75,13 @@ export interface CreateDraftSettings {
   tournamentFormat: TournamentFormat;
   podPolicy: PodPolicy;
   podSize: number;
+}
+
+function draftSourceIntent(settings: CreateDraftSettings): DraftSourceIntent {
+  return settings.source ?? {
+    type: "Uniform",
+    data: { set_codes: settings.setCodes ?? [] },
+  };
 }
 
 /** Events emitted by ServerDraftAdapter for UI state updates. */
@@ -64,12 +95,26 @@ export type ServerDraftAdapterEvent =
   | { type: "draftActionRejected"; reason: string }
   | { type: "gameStateUpdated"; state: GameState; events: GameEvent[]; legalResult: LegalActionsResult; logEntries?: GameLogEntry[] }
   | { type: "gameOver"; winner: PlayerId | null; reason: string }
+  | { type: "opponentDisconnected"; graceSeconds: number }
+  | { type: "opponentReconnected" }
   | { type: "actionPendingChanged"; pending: boolean }
   | { type: "disconnected" }
   | { type: "reconnected" }
   | { type: "error"; message: string };
 
 type ServerDraftAdapterEventListener = (event: ServerDraftAdapterEvent) => void;
+
+function fullSessionKeysEqual(
+  left: FullSessionKey | null | undefined,
+  right: FullSessionKey | null | undefined,
+): boolean {
+  return left !== null
+    && left !== undefined
+    && right !== null
+    && right !== undefined
+    && left.game_code === right.game_code
+    && left.generation === right.generation;
+}
 
 // ── ServerDraftAdapter ──────────────────────────────────────────────────
 
@@ -106,15 +151,23 @@ export class ServerDraftAdapter implements EngineAdapter {
   private _playerId: PlayerId | null = null;
   private activeMatchId: string | null = null;
   private _gameCode: string | null = null;
+  /** Full match lifetime announced by DraftMatchStart. */
+  private activeFullKey: FullSessionKey | null = null;
+  /** Full match lifetime whose matching GameStarted has been accepted. */
+  private acceptedFullKey: FullSessionKey | null = null;
 
   // ── Infrastructure ─────────────────────────────────────────────────
-  private ws: WebSocket | null = null;
+  private ws: PhaseSocketTransport | null = null;
   private pendingResolve: ((result: SubmitResult) => void) | null = null;
   private pendingReject: ((error: Error) => void) | null = null;
   private nextManaPaymentPreviewRequestId = 1;
   private pendingManaPaymentPreviews = new Map<
     number,
     { resolve: (sourceIds: ObjectId[]) => void; reject: (error: Error) => void }
+  >();
+  private pendingInteractionPreviews = new Map<
+    string,
+    { resolve: (preview: InteractionPreview) => void; reject: (error: Error) => void }
   >();
   private draftResolve: ((view: DraftPlayerView) => void) | null = null;
   private draftReject: ((error: Error) => void) | null = null;
@@ -243,6 +296,27 @@ export class ServerDraftAdapter implements EngineAdapter {
     });
   }
 
+  async previewInteraction(
+    request: InteractionPreviewRequest,
+    _actor: PlayerId,
+  ): Promise<InteractionPreview> {
+    if (this.phase !== "match") {
+      throw new AdapterError("PHASE_ERROR", "Not in a match phase", false);
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
+    }
+
+    return new Promise<InteractionPreview>((resolve, reject) => {
+      this.pendingInteractionPreviews.set(request.requestId, { resolve, reject });
+      // `request` is forwarded VERBATIM — no field is read, reshaped or rebuilt.
+      if (!this.send({ type: "PreviewInteraction", data: { request } })) {
+        this.pendingInteractionPreviews.delete(request.requestId);
+        reject(new AdapterError("WS_CLOSED", "Failed to send interaction preview", true));
+      }
+    });
+  }
+
   async getState(): Promise<GameState> {
     if (!this.snapshot) {
       throw new AdapterError("WS_ERROR", "No game state available", false);
@@ -298,7 +372,7 @@ export class ServerDraftAdapter implements EngineAdapter {
         type: "CreateDraftWithSettings",
         data: {
           display_name: settings.displayName,
-          set_code: settings.setCode,
+          source: draftSourceIntent(settings),
           kind: settings.kind,
           public: settings.public,
           password: settings.password ?? null,
@@ -355,7 +429,7 @@ export class ServerDraftAdapter implements EngineAdapter {
           draft_code: this.draftCode,
           action: {
             type: "Pick",
-            data: { seat: this.seatIndex, card_instance_id: cardInstanceId },
+            data: { seat: this.seatIndex, card_instance_ids: [cardInstanceId] },
           },
         },
       });
@@ -367,7 +441,7 @@ export class ServerDraftAdapter implements EngineAdapter {
     });
   }
 
-  async submitDeck(mainDeck: string[]): Promise<DraftPlayerView> {
+  async submitDeck(mainDeck: string[], commanders: string[]): Promise<DraftPlayerView> {
     if (this.seatIndex === null || this.draftCode === null) {
       throw new AdapterError("PHASE_ERROR", "Not in a draft session", false);
     }
@@ -380,7 +454,11 @@ export class ServerDraftAdapter implements EngineAdapter {
           draft_code: this.draftCode,
           action: {
             type: "SubmitDeck",
-            data: { seat: this.seatIndex, main_deck: mainDeck },
+            // Key order mirrors the Rust struct's field order (`seat`,
+            // `main_deck`, `commanders`). `private send(msg: unknown)` means
+            // no typechecker sees this payload, so the byte-exact
+            // `JSON.stringify` assertion in the suite is what pins it.
+            data: { seat: this.seatIndex, main_deck: mainDeck, commanders },
           },
         },
       });
@@ -480,6 +558,9 @@ export class ServerDraftAdapter implements EngineAdapter {
       this.rejectPendingManaPaymentPreviews(
         new AdapterError("WS_CLOSED", "Connection closed during mana-payment preview", true),
       );
+      this.rejectPendingInteractionPreviews(
+        new AdapterError("WS_CLOSED", "Connection closed during interaction preview", true),
+      );
       if (this.draftReject) {
         this.draftReject(
           new AdapterError("WS_CLOSED", "Connection closed during draft operation", true),
@@ -575,21 +656,60 @@ export class ServerDraftAdapter implements EngineAdapter {
           match_id: string;
           round: number;
           game_code: string;
+          full_key?: FullSessionKey;
           player_token: string;
           your_player: PlayerId;
           opponent_name: string;
         };
+        if (
+          !data.full_key
+          || data.full_key.game_code !== data.game_code
+          || data.full_key.generation < 1
+        ) {
+          this.emit({
+            type: "error",
+            message: "Server omitted a valid Full session identity for the draft match.",
+          });
+          break;
+        }
+        const sameMatch =
+          this.activeMatchId === data.match_id
+          && this._gameCode === data.game_code
+          && this._playerId === data.your_player
+          && fullSessionKeysEqual(this.activeFullKey, data.full_key);
+        if (!sameMatch) {
+          this.snapshot = null;
+          this.acceptedFullKey = null;
+        }
         this.phase = "match";
         this.activeMatchId = data.match_id;
         this._playerId = data.your_player;
         this._gameCode = data.game_code;
-        this.emit({
-          type: "matchStarting",
-          matchId: data.match_id,
-          round: data.round,
-          opponentName: data.opponent_name,
-          gameCode: data.game_code,
-        });
+        this.draftToken = data.player_token;
+        this.activeFullKey = data.full_key;
+        if (!sameMatch) {
+          if (this.draftCode && this.draftToken) {
+            this.send({
+              type: "ReconnectDraft",
+              data: {
+                draft_code: this.draftCode,
+                player_token: this.draftToken,
+              },
+            });
+          } else {
+            this.emit({
+              type: "error",
+              message: "Cannot attach draft match without draft credentials.",
+            });
+          }
+          this.emit({
+            type: "matchStarting",
+            matchId: data.match_id,
+            round: data.round,
+            opponentName: data.opponent_name,
+            gameCode: data.game_code,
+          });
+        }
         break;
       }
 
@@ -630,9 +750,20 @@ export class ServerDraftAdapter implements EngineAdapter {
           mana_payment_shortcut_actions?: GameAction[];
           spell_costs?: Record<string, ManaCost>;
           legal_actions_by_object?: Record<string, ObjectAction[]>;
+          activation_block_reasons?: Record<string, AbilityBlockEntry[]>;
           viewer_interaction?: LegalActionsResult["viewerInteraction"];
           derived?: GameState["derived"];
+          full_key?: FullSessionKey;
         };
+        if (
+          this.activeMatchId === null
+          || this._gameCode === null
+          || this._playerId !== data.your_player
+          || !fullSessionKeysEqual(data.full_key, this.activeFullKey)
+        ) {
+          break;
+        }
+        this.acceptedFullKey = data.full_key ?? null;
         const startedSnapshot = this.cacheSnapshot(
           { ...data.state, derived: data.derived ?? data.state.derived },
           {
@@ -642,6 +773,7 @@ export class ServerDraftAdapter implements EngineAdapter {
             manaPaymentShortcutActions: data.mana_payment_shortcut_actions ?? [],
             spellCosts: data.spell_costs,
             legalActionsByObject: data.legal_actions_by_object,
+            activationBlockReasons: data.activation_block_reasons,
             viewerInteraction: data.viewer_interaction,
           },
         );
@@ -665,10 +797,15 @@ export class ServerDraftAdapter implements EngineAdapter {
           mana_payment_shortcut_actions?: GameAction[];
           spell_costs?: Record<string, ManaCost>;
           legal_actions_by_object?: Record<string, ObjectAction[]>;
+          activation_block_reasons?: Record<string, AbilityBlockEntry[]>;
           viewer_interaction?: LegalActionsResult["viewerInteraction"];
           log_entries?: GameLogEntry[];
           derived?: GameState["derived"];
+          full_key?: FullSessionKey;
         };
+        if (!fullSessionKeysEqual(data.full_key, this.acceptedFullKey)) {
+          break;
+        }
         const updateSnapshot = this.cacheSnapshot(
           { ...data.state, derived: data.derived ?? data.state.derived },
           {
@@ -678,6 +815,7 @@ export class ServerDraftAdapter implements EngineAdapter {
             manaPaymentShortcutActions: data.mana_payment_shortcut_actions ?? [],
             spellCosts: data.spell_costs,
             legalActionsByObject: data.legal_actions_by_object,
+            activationBlockReasons: data.activation_block_reasons,
             viewerInteraction: data.viewer_interaction,
           },
         );
@@ -699,7 +837,7 @@ export class ServerDraftAdapter implements EngineAdapter {
       }
 
       case "ActionRejected": {
-        const data = msg.data as { reason: string };
+        const data = msg.data as { rejection?: unknown };
         this.emit({ type: "actionPendingChanged", pending: false });
         if (this.pendingReject) {
           // Game-phase action rejection. `ServerDraftAdapter` is a full
@@ -714,9 +852,26 @@ export class ServerDraftAdapter implements EngineAdapter {
           // carries a pick/pass rejection, which is not a `GameAction` at all,
           // so no stale-action verdict is possible — it is a separate draft
           // protocol concern and stays a plain recoverable rejection.
-          this.pendingReject(actionRejectionError(data.reason));
+          this.pendingReject(
+            isActionRejection(data.rejection)
+              ? actionRejectionError(data.rejection)
+              : new AdapterError(AdapterErrorCode.WASM_ERROR, "Server sent an invalid action rejection.", false),
+          );
           this.pendingResolve = null;
           this.pendingReject = null;
+        }
+        break;
+      }
+
+      case "ActionFailed": {
+        const data = msg.data as { message: string };
+        if (this.pendingReject) {
+          this.emit({ type: "actionPendingChanged", pending: false });
+          this.pendingReject(new AdapterError("WS_ERROR", data.message, false));
+          this.pendingResolve = null;
+          this.pendingReject = null;
+        } else {
+          this.emit({ type: "error", message: data.message });
         }
         break;
       }
@@ -732,7 +887,7 @@ export class ServerDraftAdapter implements EngineAdapter {
       }
 
       case "ManaPaymentPreviewRejected": {
-        const data = msg.data as { request_id: number; reason: string };
+        const data = msg.data as { request_id: number; rejection?: unknown };
         const pending = this.pendingManaPaymentPreviews.get(data.request_id);
         if (pending) {
           this.pendingManaPaymentPreviews.delete(data.request_id);
@@ -742,7 +897,41 @@ export class ServerDraftAdapter implements EngineAdapter {
           // the request — and a stale preview is likewise void rather than
           // retryable. Non-stale reasons still classify as recoverable
           // ACTION_REJECTED, so existing surface/retry behavior is unchanged.
-          pending.reject(actionRejectionError(data.reason));
+          pending.reject(
+            isActionRejection(data.rejection)
+              ? actionRejectionError(data.rejection)
+              : new AdapterError(AdapterErrorCode.WASM_ERROR, "Server sent an invalid mana-payment rejection.", false),
+          );
+        }
+        break;
+      }
+
+      case "ManaPaymentPreviewFailed": {
+        const data = msg.data as { request_id: number; message: string };
+        const pending = this.pendingManaPaymentPreviews.get(data.request_id);
+        if (pending) {
+          this.pendingManaPaymentPreviews.delete(data.request_id);
+          pending.reject(new AdapterError("WS_ERROR", data.message, false));
+        }
+        break;
+      }
+
+      case "InteractionPreview": {
+        const data = msg.data as { preview: InteractionPreview };
+        const pending = this.pendingInteractionPreviews.get(data.preview.requestId);
+        if (pending) {
+          this.pendingInteractionPreviews.delete(data.preview.requestId);
+          pending.resolve(data.preview);
+        }
+        break;
+      }
+
+      case "InteractionPreviewFailed": {
+        const data = msg.data as { request_id: string; message: string };
+        const pending = this.pendingInteractionPreviews.get(data.request_id);
+        if (pending) {
+          this.pendingInteractionPreviews.delete(data.request_id);
+          pending.reject(new AdapterError("WS_ERROR", data.message, false));
         }
         break;
       }
@@ -754,6 +943,8 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.phase = "between_rounds";
         this.activeMatchId = null;
         this._gameCode = null;
+        this.activeFullKey = null;
+        this.acceptedFullKey = null;
         this.snapshot = null;
         this.emit({ type: "actionPendingChanged", pending: false });
         this.emit({
@@ -761,6 +952,29 @@ export class ServerDraftAdapter implements EngineAdapter {
           winner: data.winner,
           reason: data.reason,
         });
+        break;
+      }
+
+      case "OpponentDisconnected": {
+        const data = msg.data as {
+          grace_seconds: number;
+          full_key?: FullSessionKey;
+        };
+        if (!fullSessionKeysEqual(data.full_key, this.acceptedFullKey)) {
+          break;
+        }
+        this.emit({
+          type: "opponentDisconnected",
+          graceSeconds: data.grace_seconds,
+        });
+        break;
+      }
+
+      case "OpponentReconnected": {
+        const data = (msg.data ?? {}) as { full_key?: FullSessionKey };
+        if (fullSessionKeysEqual(data.full_key, this.acceptedFullKey)) {
+          this.emit({ type: "opponentReconnected" });
+        }
         break;
       }
 
@@ -875,6 +1089,13 @@ export class ServerDraftAdapter implements EngineAdapter {
     this.pendingManaPaymentPreviews.clear();
   }
 
+  private rejectPendingInteractionPreviews(error: Error): void {
+    for (const { reject } of this.pendingInteractionPreviews.values()) {
+      reject(error);
+    }
+    this.pendingInteractionPreviews.clear();
+  }
+
   dispose(): void {
     this.disposed = true;
     if (this.pingInterval) {
@@ -893,15 +1114,35 @@ export class ServerDraftAdapter implements EngineAdapter {
     this.draftView = null;
     this.seatIndex = null;
     this.activeMatchId = null;
-    this.pendingResolve = null;
-    this.pendingReject = null;
+    this.activeFullKey = null;
+    this.acceptedFullKey = null;
+    if (this.pendingReject) {
+      this.pendingReject(
+        new AdapterError("WS_CLOSED", "Adapter disposed during action", true),
+      );
+      this.pendingResolve = null;
+      this.pendingReject = null;
+    }
     this.rejectPendingManaPaymentPreviews(
       new AdapterError("WS_CLOSED", "Adapter disposed during mana-payment preview", true),
     );
-    this.draftResolve = null;
-    this.draftReject = null;
-    this.initResolve = null;
-    this.initReject = null;
+    this.rejectPendingInteractionPreviews(
+      new AdapterError("WS_CLOSED", "Adapter disposed during interaction preview", true),
+    );
+    if (this.draftReject) {
+      this.draftReject(
+        new AdapterError("WS_CLOSED", "Adapter disposed during draft operation", true),
+      );
+      this.draftResolve = null;
+      this.draftReject = null;
+    }
+    if (this.initReject) {
+      this.initReject(
+        new AdapterError("WS_CLOSED", "Adapter disposed before draft started", true),
+      );
+      this.initResolve = null;
+      this.initReject = null;
+    }
     this._serverInfo = null;
     this.emit({ type: "actionPendingChanged", pending: false });
     this.listeners = [];

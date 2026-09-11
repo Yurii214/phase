@@ -171,6 +171,21 @@ html {
   color-scheme: dark;
 }
 
+@utility draft-card-area-drop-active {
+  isolation: isolate;
+  background-color: rgb(255 255 255 / 0.08);
+
+  &::after {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border: 1px solid rgb(255 255 255 / 0.96);
+    border-radius: inherit;
+    box-shadow: 0 0 18px 2px rgb(255 255 255 / 0.68);
+    content: "";
+  }
+}
+
 body {
   background:
     radial-gradient(circle at top, rgba(251, 146, 60, 0.12), transparent 30%),

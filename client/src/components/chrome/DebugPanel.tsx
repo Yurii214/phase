@@ -11,10 +11,10 @@ import { usePlayerId } from "../../hooks/usePlayerId";
 import { getSeatColor } from "../../hooks/useSeatColor";
 import {
   copyGameStateDebugSnapshot,
-  exportGameStateDebugZip,
+  exportAuthoritativeGameStateZip,
 } from "../../services/gameStateExport";
 import { gameStateFromImportText, readImportFile } from "../../services/gameStateImport";
-import { useGameStore } from "../../stores/gameStore";
+import { canExportAuthoritativeState, useGameStore } from "../../stores/gameStore";
 import { getPlayerDisplayName } from "../../stores/multiplayerStore";
 import { useUiStore } from "../../stores/uiStore";
 import { DebugActions } from "./DebugActions";
@@ -71,6 +71,8 @@ export function DebugPanel({
   const adapter = useGameStore((s) => s.adapter);
   const gameState = useGameStore((s) => s.gameState);
   const gameMode = useGameStore((s) => s.gameMode);
+  const canExportAuthoritative = canExportAuthoritativeState(gameMode)
+    && adapter?.exportPersistenceState !== undefined;
   // The transport, not the mode, decides whether a rollback request can be
   // bound to an authenticated session — same idiom as `supportsMatchConcede`.
   const rewindAdapter = supportsServerRewind(adapter) ? adapter : null;
@@ -86,7 +88,6 @@ export function DebugPanel({
     () => new Set<ConsoleLevel>(["log", "warn", "error"]),
   );
   const consoleContainerRef = useRef<HTMLDivElement>(null);
-  const consoleEndRef = useRef<HTMLDivElement>(null);
 
   // Smart scroll tracking: only auto-scroll if user is at the bottom
   const isAtBottomRef = useRef(true);
@@ -173,14 +174,14 @@ export function DebugPanel({
   }, [gameState]);
 
   const handleExportGameState = useCallback(() => {
-    if (!gameState) return;
-    exportGameStateDebugZip(gameState)
+    if (!adapter) return;
+    exportAuthoritativeGameStateZip(adapter)
       .then((filename) => setStatus({ type: "success", message: `Exported ${filename}` }))
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setStatus({ type: "error", message: "Failed to export game state" });
       });
-  }, [gameState]);
+  }, [adapter]);
 
   // Same destination as the top-left report flag. Close this panel first — it
   // renders at z-[9999], above the report dialog's z-50 overlay, so leaving it
@@ -190,11 +191,20 @@ export function DebugPanel({
     useUiStore.getState().openCardReportDialog();
   }, []);
 
+  // Do not use `scrollIntoView()` here. The panel is rendered inside the
+  // paint-contained game board, so that method can also scroll the locked game
+  // viewport and leave the battlefield displaced after the panel closes.
+  const scrollConsoleToBottom = useCallback(() => {
+    const container = consoleContainerRef.current;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
+  }, []);
+
   const scrollToBottom = useCallback(() => {
-    consoleEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    scrollConsoleToBottom();
     setNewMessageCount(0);
     setShowJumpToBottom(false);
-  }, []);
+  }, [scrollConsoleToBottom]);
 
   const visibleEntries = consoleSnapshot.filter((e) => enabledLevels.has(e.level));
 
@@ -288,11 +298,11 @@ export function DebugPanel({
     if (added <= 0) return;
 
     if (isAtBottomRef.current) {
-      consoleEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      scrollConsoleToBottom();
     } else {
       setNewMessageCount((prev) => prev + added);
     }
-  }, [visibleEntries]);
+  }, [scrollConsoleToBottom, visibleEntries]);
 
   if (!open) return null;
 
@@ -518,11 +528,11 @@ export function DebugPanel({
           </button>
           <button
             onClick={handleExportGameState}
-            disabled={!gameState}
+            disabled={!canExportAuthoritative}
             className="mt-1 w-full rounded bg-gray-800 px-2 py-1 text-xs transition-colors hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
-            title="Download the current debug game state as minified JSON inside a compressed ZIP"
+            title={t("debug.exportAuthoritativeTitle")}
           >
-            Export Game State
+            {t("debug.exportAuthoritative")}
           </button>
         </section>
 
@@ -620,7 +630,6 @@ export function DebugPanel({
                   {entry.message}
                 </div>
               ))}
-              <div ref={consoleEndRef} />
             </div>
             {showJumpToBottom && (
               <button

@@ -435,6 +435,7 @@ mod tests {
         obj.base_color = vec![ManaColor::White];
 
         obj.back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: "Kenzo the Hardhearted".to_string(),
             power: Some(3),
             toughness: Some(4),
@@ -855,7 +856,7 @@ mod tests {
         let become_copy = ResolvedAbility::new(
             Effect::BecomeCopy {
                 target: TargetFilter::Any,
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(Duration::Permanent),
                 mana_value_limit: None,
                 additional_modifications: Vec::new(),

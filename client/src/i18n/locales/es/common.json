@@ -5,6 +5,10 @@
     "close": "Cerrar",
     "closeNamed": "Cerrar {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Exportar estado de juego autoritativo",
+    "exportAuthoritativeTitle": "Descarga el estado propiedad del motor que se usa para diagnosticar y restaurar esta partida"
+  },
   "quantityRef": {
     "highestNumber": "el número más alto",
     "lowestNumber": "el número más bajo",
@@ -20,7 +24,7 @@
   },
   "pausedBanner": {
     "message": "Partida en pausa — {{reason}}",
-    "resume": "Reanudar"
+    "resume": "Reanudar partida"
   },
   "fullscreen": {
     "enter": "Activar pantalla completa",
@@ -58,10 +62,15 @@
     "updateIssue": "problema de actualización",
     "updated": "actualizado"
   },
+  "offlineBadge": {
+    "label": "Sin conexión",
+    "servicesPaused": "Las actualizaciones y los servicios en línea están en pausa.",
+    "forced": "Trabajar sin conexión está activado.",
+    "connection": "No hay conexión de red."
+  },
   "comboDetector": {
     "label": "Detector de combos (experimental)",
     "title": "Detectar bucles infinitos: terminar bucles obligatorios automáticamente y mostrar recursos ∞ (desactivado por defecto)",
-    "on": "Activado",
     "off": "Desactivado",
     "interactive": "Interactivo"
   },
@@ -79,7 +88,8 @@
     "clickModeButton": "Botón de modo clic",
     "shown": "Visible",
     "hidden": "Oculto",
-    "resume": "Reanudar",
+    "openGameLog": "Abrir el registro de la partida",
+    "closeGameLog": "Cerrar el registro de la partida",
     "settings": "Ajustes",
     "boardLayoutSplit": "Dividido",
     "boardLayoutLegacy": "Legacy",
@@ -103,6 +113,7 @@
   },
   "volume": {
     "deviceBlocked": "Audio no disponible — el servidor de audio del sistema no responde. Reinicia la aplicación para reintentar.",
+    "mediaUnavailable": "Audio no disponible — a este sistema le faltan los componentes multimedia necesarios para reproducir sonido. Instala los paquetes de complementos de GStreamer de tu distribución y reinicia la aplicación.",
     "mute": "Silenciar",
     "unmute": "Activar sonido",
     "volume": "Volumen"
@@ -295,7 +306,15 @@
     "back": "Atrás",
     "settings": "Ajustes",
     "languageSettings": "Idioma ({{lang}}) — abrir ajustes",
-    "languageTitle": "Idioma: {{lang}}"
+    "languageTitle": "Idioma: {{lang}}",
+    "statusBanner": {
+      "dismiss": "Descartar este mensaje",
+      "severity": {
+        "info": "Aviso",
+        "warning": "Atención",
+        "critical": "Importante"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Algo salió mal",

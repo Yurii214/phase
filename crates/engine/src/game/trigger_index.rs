@@ -494,6 +494,7 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         // CR 732.2: a halted-resolution notification produces no trigger keys.
         GameEvent::GameStarted
         | GameEvent::HiddenSearchViewed { .. }
+        | GameEvent::ExtraTurnCreated { .. }
         | GameEvent::ResolutionHalted { .. } => {}
         GameEvent::TurnStarted { .. } => push(TriggerEventKey::TurnStarted),
         GameEvent::PhaseChanged { phase } => push(TriggerEventKey::BeginningOfPhase(*phase)),
@@ -577,12 +578,10 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
             if *to == Zone::Exile {
                 push(TriggerEventKey::Exiled);
             }
-            // CR 701.17: `match_milled` consumes `ZoneChanged { from: Library,
-            // to: Graveyard }`. Emit Milled key for that exact shape.
-            if *from == Some(Zone::Library) && *to == Zone::Graveyard {
-                push(TriggerEventKey::Milled);
-            }
         }
+        // CR 701.17a: the mill's own action event is what `match_milled`
+        // consumes; the library→graveyard zone shape above no longer routes here.
+        GameEvent::Milled { .. } => push(TriggerEventKey::Milled),
         GameEvent::LifeChanged { .. } => push(TriggerEventKey::LifeChanged),
         GameEvent::ControllerChanged { .. } => push(TriggerEventKey::ChangesController),
         GameEvent::ManaAdded { .. } => push(TriggerEventKey::ManaProduced),
@@ -864,6 +863,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::Shuffle
         | EffectKind::SearchLibrary
         | EffectKind::SearchOutsideGame
+        | EffectKind::OpenBoosterPack
         | EffectKind::ExileTop
         | EffectKind::ExileFaceDownPile
         | EffectKind::TargetOnly
@@ -1174,6 +1174,12 @@ pub fn ensure_ready(state: &mut GameState) {
 /// keys hit, plus the `unclassified` bucket. Caller dedups against the
 /// per-event `registered_this_event` set as usual.
 pub fn candidates_for_event(state: &GameState, event: &GameEvent) -> SmallVec<[ObjectId; 16]> {
+    // CR 500.7: creating an extra turn adds it directly after the specified
+    // turn. `ExtraTurnCreated` is internal accounting for that insertion, not
+    // a triggerable game event, so it must not reach catch-all definitions.
+    if matches!(event, GameEvent::ExtraTurnCreated { .. }) {
+        return SmallVec::new();
+    }
     let mut out: SmallVec<[ObjectId; 16]> = SmallVec::new();
     out.extend(state.trigger_index.unclassified.iter().copied());
     let keys = keys_from_event(event, state);
@@ -1360,6 +1366,37 @@ mod tests {
     }
 
     #[test]
+    fn extra_turn_creation_does_not_route_unclassified_candidates() {
+        let mut state = GameState::new_two_player(42);
+        let watcher = ObjectId(99);
+        state.objects.insert(
+            watcher,
+            GameObject::new(
+                watcher,
+                CardId(99),
+                PlayerId(0),
+                "Always Watcher".to_string(),
+                Zone::Battlefield,
+            ),
+        );
+        state.trigger_index.add(
+            watcher,
+            &[TriggerDefinition::new(TriggerMode::Always)],
+            false,
+        );
+        assert!(state.trigger_index.unclassified.contains(&watcher));
+
+        let candidates = candidates_for_event(
+            &state,
+            &GameEvent::ExtraTurnCreated {
+                player_id: PlayerId(0),
+                anchor: PlayerId(1),
+            },
+        );
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
     fn cumulative_upkeep_emits_upkeep_phase_key() {
         let def = TriggerDefinition::new(TriggerMode::PayCumulativeUpkeep);
         let (keys, _) = keys_from_trigger_def(&def);
@@ -1383,6 +1420,28 @@ mod tests {
             &state,
         );
         assert!(event_keys.contains(&TriggerEventKey::PhaseIn));
+    }
+
+    #[test]
+    fn extra_turn_creation_is_trigger_inert() {
+        let state = GameState::new_two_player(42);
+        let creation_keys = keys_from_event(
+            &GameEvent::ExtraTurnCreated {
+                player_id: PlayerId(0),
+                anchor: PlayerId(1),
+            },
+            &state,
+        );
+        assert!(creation_keys.is_empty());
+
+        let turn_started_keys = keys_from_event(
+            &GameEvent::TurnStarted {
+                player_id: PlayerId(0),
+                turn_number: 2,
+            },
+            &state,
+        );
+        assert!(turn_started_keys.contains(&TriggerEventKey::TurnStarted));
     }
 
     #[test]
@@ -1421,8 +1480,9 @@ mod tests {
     #[test]
     fn from_anywhere_to_graveyard_candidate_survives_library_origin_event() {
         // CR 603.6c: "from anywhere" includes library→graveyard moves. The
-        // event side emits only Milled for this shape, so this class must stay
-        // in the unclassified safety bucket until a generic graveyard key exists.
+        // event side emits NO key at all for this shape, so the unclassified
+        // safety bucket — which `candidates_for_event` unions unconditionally —
+        // is what carries this class until a generic graveyard key exists.
         let mut state = GameState::new_two_player(42);
         let watcher = ObjectId(99);
         let def = TriggerDefinition::new(TriggerMode::ChangesZone)
@@ -1443,6 +1503,42 @@ mod tests {
 
         let candidates = candidates_for_event(&state, &event);
         assert!(candidates.contains(&watcher));
+    }
+
+    /// CR 701.17a: the mill key's event-side source moved off the zone shape and
+    /// onto the action event. Both legs run in one invocation, so a
+    /// `keys_from_event` that answered nothing at all cannot pass.
+    #[test]
+    fn milled_key_comes_from_the_action_event_not_the_zone_shape() {
+        let state = GameState::new_two_player(42);
+
+        let zone_change = GameEvent::ZoneChanged {
+            object_id: ObjectId(7),
+            from: Some(Zone::Library),
+            to: Zone::Graveyard,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                ObjectId(7),
+                Some(Zone::Library),
+                Zone::Graveyard,
+            )),
+        };
+        assert!(
+            !keys_from_event(&zone_change, &state).contains(&TriggerEventKey::Milled),
+            "the library→graveyard zone shape must no longer carry the Milled key"
+        );
+
+        for to in [Zone::Graveyard, Zone::Exile] {
+            let milled = GameEvent::Milled {
+                player_id: PlayerId(0),
+                object_id: ObjectId(7),
+                to,
+            };
+            assert!(
+                keys_from_event(&milled, &state).contains(&TriggerEventKey::Milled),
+                "the CR 701.17a action event carries the Milled key whatever zone \
+                 the card reached (CR 701.17c); {to:?} did not"
+            );
+        }
     }
 
     #[test]

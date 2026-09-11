@@ -25,8 +25,8 @@ use engine::types::events::{GameEvent, PlayerActionKind};
 use engine::types::game_state::{
     BatchCompletion, CastPaymentMode, CollectEvidenceResume, ExileLinkKind, GameState,
     ManaAbilityCostParentLifecycle, ManaAbilityCostResolutionMode, ManaAbilityResume, ManaChoice,
-    PayCostKind, PendingCast, PendingCostMoveResume, PendingReplacement, StackEntryKind,
-    WaitingFor, ZoneDeliveryExileTracking,
+    PayCostKind, PendingCast, PendingCostMoveResume, PendingReplacement, PersistedGameState,
+    StackEntryKind, WaitingFor, ZoneDeliveryExileTracking,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -34,6 +34,7 @@ use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
 use engine::types::phase::Phase;
 use engine::types::proposed_event::{ProposedEvent, ReplacementId};
 use engine::types::replacements::ReplacementEvent;
+use engine::types::resolution::ResolutionStateWire;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::{EtbTapState, Zone};
 use std::sync::Arc;
@@ -237,6 +238,124 @@ fn dig_rest_pile_library_redirect_pauses_before_tracked_set_publish() {
         .expect("first attempted rest card is outside the parked suffix");
     assert_ne!(runner.state().objects[&redirected_id].zone, Zone::Library);
     assert_eq!(runner.state().objects[&parked_order[0]].zone, Zone::Library);
+}
+
+/// CR 608.2c + CR 616.1: declining an up-to Dig selection publishes its empty
+/// kept set after a deferred rest-pile delivery; it must not publish the cards
+/// that merely completed the rest route.
+#[test]
+fn dig_zero_kept_deferred_rest_pile_publishes_an_empty_tracked_set() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Zero-Kept Dig Source", 1, 1).id();
+    let rest_a = scenario
+        .add_spell_to_library_top(P0, "Zero-Kept Rest A", true)
+        .id();
+    let rest_b = scenario
+        .add_spell_to_library_top(P0, "Zero-Kept Rest B", true)
+        .id();
+    let redirect_sources = [
+        scenario
+            .add_creature(P0, "Zero-Kept Library To Graveyard", 0, 0)
+            .as_enchantment()
+            .with_replacement_definition(redirect_moved_to(Zone::Library, Zone::Graveyard))
+            .id(),
+        scenario
+            .add_creature(P0, "Zero-Kept Library To Exile", 0, 0)
+            .as_enchantment()
+            .with_replacement_definition(redirect_moved_to(Zone::Library, Zone::Exile))
+            .id(),
+    ];
+
+    let mut runner = scenario.build();
+    runner.state_mut().players[P0.0 as usize].library = im::vector![rest_a, rest_b];
+    let ability = ResolvedAbility::new(
+        Effect::Dig {
+            player: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 2 },
+            destination: None,
+            keep_count: Some(1),
+            keep_count_expr: None,
+            up_to: true,
+            filter: TargetFilter::Any,
+            rest_destination: Some(Zone::Library),
+            rest_order: DigRestOrder::Preserve,
+            reveal: true,
+            enter_tapped: false,
+            enters_attacking: false,
+            source: DigSource::Library,
+        },
+        vec![],
+        source,
+        P0,
+    );
+    let mut initial_events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut initial_events, 0)
+        .expect("Dig reaches its up-to selection");
+
+    let paused = runner
+        .act(GameAction::SelectCards { cards: vec![] })
+        .expect("an empty up-to selection reaches the rest-pile replacement choice");
+    assert!(matches!(
+        paused.waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+
+    let reparking = runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("the first rest redirect reaches the remaining rest card");
+    assert!(matches!(
+        reparking.waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    for redirect_source in redirect_sources {
+        let redirect_source = runner
+            .state_mut()
+            .objects
+            .get_mut(&redirect_source)
+            .expect("synthetic redirect source remains on the battlefield");
+        redirect_source.replacement_definitions.clear();
+        Arc::make_mut(&mut redirect_source.base_replacement_definitions).clear();
+    }
+    let completed = runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("the remaining rest-pile delivery completes");
+    assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
+    let redirected_rest = [rest_a, rest_b]
+        .into_iter()
+        .find(|id| {
+            matches!(
+                runner.state().objects[id].zone,
+                Zone::Graveyard | Zone::Exile
+            )
+        })
+        .expect("one rest-pile card must take the configured redirect");
+    let returned_rest = [rest_a, rest_b]
+        .into_iter()
+        .find(|id| runner.state().objects[id].zone == Zone::Library)
+        .expect("the other rest-pile card must complete its library placement");
+    assert_ne!(redirected_rest, returned_rest);
+    assert!(
+        runner.state().players[P0.0 as usize]
+            .library
+            .contains(&returned_rest),
+        "the unredirected rest-pile card must be present in P0's library"
+    );
+
+    let tracked = runner
+        .state()
+        .tracked_object_sets
+        .get(
+            &runner
+                .state()
+                .chain_tracked_set_id
+                .expect("the deferred Dig completion publishes a tracked set"),
+        )
+        .expect("the freshly-published Dig tracked set exists");
+    assert!(
+        tracked.is_empty(),
+        "the rest-pile delivery must not replace an empty kept selection"
+    );
 }
 
 /// W-R3 (red first): deterministic Dig's nonbattlefield kept batch must defer
@@ -535,9 +654,10 @@ fn uninterrupted_dig_rest_and_mass_put_all_complete_synchronously() {
     assert_eq!(mass_tracked, &vec![selected_a, selected_b]);
 }
 
-/// W-R2: A `RevealRestPile` already deferred behind a kept-card replacement can
-/// itself start a Library-bottom batch that re-pauses while draining. Its cleanup
-/// must survive both pause boundaries and publish exactly once at the true end.
+/// W-R2: A Dig's deferred completion can itself start a Library-bottom batch
+/// that re-pauses while draining. Its cleanup must survive both pause boundaries
+/// and publish exactly once at the true end, regardless of which completion
+/// carrier owns the kept-card delivery.
 #[test]
 fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
     let mut scenario = GameScenario::new();
@@ -609,13 +729,19 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         kept_pause.waiting_for,
         WaitingFor::ReplacementChoice { .. }
     ));
-    assert!(matches!(
-        runner
-            .state()
-            .active_batch_delivery()
-            .and_then(|pending| pending.completion.as_ref()),
-        Some(BatchCompletion::RevealRestPile { .. })
-    ));
+    assert!(
+        matches!(
+            runner
+                .state()
+                .active_batch_delivery()
+                .and_then(|pending| pending.completion.as_ref()),
+            Some(BatchCompletion::RevealRestPile {
+                delivery_stage: engine::types::game_state::DigDeliveryStage::Kept,
+                ..
+            })
+        ),
+        "the kept-card pause must retain a RevealRestPile completion for the deferred rest pile"
+    );
 
     let rest_pause = runner
         .act(GameAction::ChooseReplacement { index: 0 })
@@ -629,10 +755,16 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         .active_batch_delivery()
         .expect("the second rest placement is parked behind the first redirect");
     assert_eq!(first_rest_park.remaining.len(), 1);
-    assert!(matches!(
-        first_rest_park.completion.as_ref(),
-        Some(BatchCompletion::RevealRestPile { .. })
-    ));
+    assert!(
+        matches!(
+            first_rest_park.completion.as_ref(),
+            Some(BatchCompletion::RevealRestPile {
+                delivery_stage: engine::types::game_state::DigDeliveryStage::Rest,
+                ..
+            })
+        ),
+        "the first rest redirect must retain the RevealRestPile completion"
+    );
     assert!(runner.state().chain_tracked_set_id.is_none());
 
     let reparking = runner
@@ -642,13 +774,19 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         reparking.waiting_for,
         WaitingFor::ReplacementChoice { .. }
     ));
-    assert!(matches!(
-        runner
-            .state()
-            .active_batch_delivery()
-            .and_then(|pending| pending.completion.as_ref()),
-        Some(BatchCompletion::RevealRestPile { .. })
-    ));
+    assert!(
+        matches!(
+            runner
+                .state()
+                .active_batch_delivery()
+                .and_then(|pending| pending.completion.as_ref()),
+            Some(BatchCompletion::RevealRestPile {
+                delivery_stage: engine::types::game_state::DigDeliveryStage::Rest,
+                ..
+            })
+        ),
+        "the re-parked rest delivery must retain its RevealRestPile completion"
+    );
     assert!(runner.state().chain_tracked_set_id.is_none());
 
     for redirect_source in library_redirect_sources {
@@ -664,6 +802,13 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
         .act(GameAction::ChooseReplacement { index: 0 })
         .expect("the final rest placement drains the deferred completion");
     assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
+    assert!(
+        matches!(
+            runner.state().objects[&kept].zone,
+            Zone::Graveyard | Zone::Exile
+        ),
+        "the kept battlefield entry must take one configured redirect"
+    );
     let tracked = runner
         .state()
         .tracked_object_sets
@@ -674,7 +819,10 @@ fn dig_deferred_reveal_rest_pile_repauses_and_completes_once() {
                 .expect("the Dig completion publishes after the true batch end"),
         )
         .expect("the tracked set exists");
-    assert_eq!(tracked, &vec![kept]);
+    assert!(
+        tracked.is_empty(),
+        "the kept delivery was redirected away from the requested battlefield destination"
+    );
 }
 
 fn redirect_self_moved_to(destination: Zone, redirected_to: Zone) -> ReplacementDefinition {
@@ -825,6 +973,7 @@ fn stage_prevented_cost_move(state: &mut GameState, source: engine::types::ident
         search_found_candidates: Vec::new(),
         depth: 0,
         is_optional: false,
+        choice_player: None,
         library_placement: None,
         exile_controller: None,
         exile_duration: None,
@@ -838,6 +987,8 @@ fn stage_prevented_cost_move(state: &mut GameState, source: engine::types::ident
         player: P0,
         candidate_count: 1,
         candidates: vec![],
+        kind: Default::default(),
+        last_applied_decides: false,
     };
 }
 
@@ -4580,6 +4731,7 @@ fn effect_pay_cost_composite_mana_life_prevention_serializes_and_rides_once() {
         search_found_candidates: Vec::new(),
         depth: 0,
         is_optional: false,
+        choice_player: None,
         library_placement: None,
         exile_controller: None,
         exile_duration: None,
@@ -4593,6 +4745,8 @@ fn effect_pay_cost_composite_mana_life_prevention_serializes_and_rides_once() {
         player: P0,
         candidate_count: 1,
         candidates: vec![],
+        kind: Default::default(),
+        last_applied_decides: false,
     };
 
     let json = serde_json::to_string(runner.state())
@@ -7692,7 +7846,7 @@ fn duration_bearing_delayed_whenever_event_stays_installed_and_fires_again() {
     let life_before = resolve_delayed_installer(&mut runner, installer);
     assert!(
         !runner.state().delayed_triggers[0].one_shot,
-        "CR 603.7c: a duration-bearing WheneverEvent is not a one-shot"
+        "CR 603.7b: a duration-bearing WheneverEvent is not a one-shot"
     );
 
     let acted = runner
@@ -11796,7 +11950,14 @@ fn dig_kept_nonbattlefield_redirect_pauses_before_tail() {
                 .expect("Dig publishes its kept set after the delivery settles"),
         )
         .expect("Dig tracked set exists");
-    assert_eq!(tracked, &vec![kept]);
+    assert!(
+        tracked.is_empty(),
+        "a kept card redirected away from its requested destination is absent from the settled delivery"
+    );
+    assert!(
+        runner.state().last_zone_changed_ids.is_empty(),
+        "a redirected kept card must not satisfy a requested-destination reflexive gate"
+    );
     assert_eq!(
         initial_events
             .iter()
@@ -12526,52 +12687,125 @@ fn effect_zone_sacrifice_replacement_preserves_tracked_set_and_tail() {
 
 /// W-163-D: Exploit emits its per-creature event and terminal event only after
 /// the replacement-delivered sacrifice has actually completed.
-#[test]
-fn exploit_replacement_preserves_creature_exploited_follow_up() {
+fn run_exploit_replacement_restore_case(
+    replacement_index: usize,
+    restore_through_persisted_raw: bool,
+    victim_is_token: bool,
+) {
+    const GURMAG_DROWNER: &str = "Exploit (When this creature enters, you may sacrifice a creature.)\nWhen this creature exploits a creature, look at the top four cards of your library. Put one of them into your hand and the rest into your graveyard.";
+
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let exploiter = scenario
-        .add_creature(P0, "Exploit Replacement Source", 1, 1)
-        .id();
+    let exploiter = {
+        let mut card = scenario.add_creature_to_hand(P0, "Gurmag Drowner", 2, 4);
+        card.from_oracle_text_with_keywords(&["Exploit"], GURMAG_DROWNER)
+            .id()
+    };
     let victim = scenario
         .add_creature(P0, "Exploit Replacement Victim", 1, 1)
         .with_replacement_definition(redirect_self_moved_to(Zone::Graveyard, Zone::Exile))
         .with_replacement_definition(redirect_self_moved_to(Zone::Graveyard, Zone::Hand))
         .id();
-    let ability = ResolvedAbility::new(
-        Effect::Exploit {
-            target: TargetFilter::Any,
-        },
-        vec![TargetRef::Object(victim)],
-        exploiter,
-        P0,
-    );
     let mut runner = scenario.build();
-    let mut initial_events = Vec::new();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&victim)
+        .expect("fixture victim exists")
+        .is_token = victim_is_token;
+    let paused = runner
+        .cast(exploiter)
+        .target_object(victim)
+        .accept_optional()
+        .effect_zone(&[victim])
+        .resolve();
+    assert!(matches!(
+        paused.final_waiting_for(),
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert!(!paused
+        .events()
+        .iter()
+        .any(|event| matches!(event, GameEvent::CreatureExploited { .. })));
 
-    resolve_ability_chain(runner.state_mut(), &ability, &mut initial_events, 0)
-        .expect("exploit reaches the replacement choice");
+    let restored = if restore_through_persisted_raw {
+        let encoded =
+            serde_json::to_value(PersistedGameState::Raw(Box::new(paused.state().clone())))
+                .expect("paused raw state serializes");
+        serde_json::from_value::<PersistedGameState>(encoded)
+            .expect("paused raw state decodes")
+            .into_game_state()
+            .expect("paused raw state satisfies restore finalization")
+    } else {
+        let encoded =
+            serde_json::to_value(ResolutionStateWire::from_game_state(paused.state().clone()))
+                .expect("paused resolution wire serializes");
+        serde_json::from_value::<ResolutionStateWire>(encoded)
+            .expect("paused resolution wire decodes")
+            .into_game_state()
+    };
+    let mut runner = GameRunner::from_state(restored);
     assert!(matches!(
         runner.state().waiting_for,
         WaitingFor::ReplacementChoice { .. }
     ));
-    assert!(!initial_events
-        .iter()
-        .any(|event| matches!(event, GameEvent::CreatureExploited { .. })));
 
     let completed = runner
-        .act(GameAction::ChooseReplacement { index: 0 })
+        .act(GameAction::ChooseReplacement {
+            index: replacement_index,
+        })
         .expect("replacement delivery completes exploit");
     assert!(matches!(completed.waiting_for, WaitingFor::Priority { .. }));
+    let expected_destination = if replacement_index == 0 {
+        Zone::Exile
+    } else {
+        Zone::Hand
+    };
+    let departure_record = completed
+        .events
+        .iter()
+        .find_map(|event| match event {
+            GameEvent::ZoneChanged {
+                object_id,
+                from: Some(Zone::Battlefield),
+                to,
+                record,
+            } if *object_id == victim && *to == expected_destination => Some(record),
+            _ => None,
+        })
+        .expect("replacement completion exposes the victim's actual departure record");
+    let exploited_event = completed
+        .events
+        .iter()
+        .find(|event| {
+            matches!(
+                event,
+                GameEvent::CreatureExploited {
+                    exploiter: event_exploiter,
+                    sacrificed,
+                    ..
+                } if *event_exploiter == exploiter && *sacrificed == victim
+            )
+        })
+        .expect("completed sacrifice emits the exploit event");
+    let GameEvent::CreatureExploited { record, .. } = exploited_event else {
+        unreachable!("the event was matched as CreatureExploited")
+    };
+    assert_eq!(record, departure_record);
     assert_eq!(
-        initial_events
+        serde_json::to_value(exploited_event).expect("event serializes")["data"]["record"],
+        serde_json::to_value(departure_record).expect("departure record serializes")
+    );
+    assert_eq!(
+        completed
+            .events
             .iter()
-            .chain(completed.events.iter())
             .filter(|event| matches!(
                 event,
                 GameEvent::CreatureExploited {
                     exploiter: event_exploiter,
                     sacrificed,
+                    ..
                 } if *event_exploiter == exploiter && *sacrificed == victim
             ))
             .count(),
@@ -12579,9 +12813,9 @@ fn exploit_replacement_preserves_creature_exploited_follow_up() {
         "the exploit follow-up is emitted once after delivery"
     );
     assert_eq!(
-        initial_events
+        completed
+            .events
             .iter()
-            .chain(completed.events.iter())
             .filter(|event| matches!(
                 event,
                 GameEvent::EffectResolved {
@@ -12593,6 +12827,25 @@ fn exploit_replacement_preserves_creature_exploited_follow_up() {
             .count(),
         1
     );
+    assert!(runner
+        .state()
+        .pending_player_scope_sacrifice_choice
+        .is_none());
+}
+
+#[test]
+fn exploit_replacement_preserves_creature_exploited_follow_up() {
+    for replacement_index in [0, 1] {
+        for restore_through_persisted_raw in [false, true] {
+            for victim_is_token in [false, true] {
+                run_exploit_replacement_restore_case(
+                    replacement_index,
+                    restore_through_persisted_raw,
+                    victim_is_token,
+                );
+            }
+        }
+    }
 }
 
 /// W-163-E: the terminal sweep of choose-and-sacrifice-rest keeps its complete
@@ -12953,6 +13206,7 @@ fn effect_zone_put_at_library_position_mixed_sources_preserves_legacy_library_or
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: Some(position),
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,

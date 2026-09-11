@@ -5,6 +5,10 @@
     "close": "Schließen",
     "closeNamed": "{{name}} schließen"
   },
+  "debug": {
+    "exportAuthoritative": "Autoritativen Spielzustand exportieren",
+    "exportAuthoritativeTitle": "Lädt den engine-eigenen Zustand herunter, mit dem dieses Spiel diagnostiziert und wiederhergestellt wird"
+  },
   "quantityRef": {
     "highestNumber": "die höchste Zahl",
     "lowestNumber": "die niedrigste Zahl",
@@ -20,7 +24,7 @@
   },
   "pausedBanner": {
     "message": "Spiel pausiert — {{reason}}",
-    "resume": "Fortsetzen"
+    "resume": "Spiel fortsetzen"
   },
   "fullscreen": {
     "enter": "Vollbild starten",
@@ -58,10 +62,15 @@
     "updateIssue": "Update-Problem",
     "updated": "aktualisiert"
   },
+  "offlineBadge": {
+    "label": "Offline",
+    "servicesPaused": "Online-Aktualisierungen und Dienste sind pausiert.",
+    "forced": "Offline arbeiten ist aktiviert.",
+    "connection": "Keine Netzwerkverbindung."
+  },
   "comboDetector": {
     "label": "Combo-Detektor (experimentell)",
     "title": "Unendliche Schleifen erkennen: Pflichtschleifen automatisch beenden und ∞-Ressourcen anzeigen (standardmäßig aus)",
-    "on": "An",
     "off": "Aus",
     "interactive": "Interaktiv"
   },
@@ -79,7 +88,8 @@
     "clickModeButton": "Klickmodus-Schaltfläche",
     "shown": "Sichtbar",
     "hidden": "Ausgeblendet",
-    "resume": "Fortsetzen",
+    "openGameLog": "Spielprotokoll öffnen",
+    "closeGameLog": "Spielprotokoll schließen",
     "settings": "Einstellungen",
     "boardLayoutSplit": "Geteilt",
     "boardLayoutLegacy": "Legacy",
@@ -103,6 +113,7 @@
   },
   "volume": {
     "deviceBlocked": "Audio nicht verfügbar — der System-Audioserver antwortet nicht. App neu starten, um es erneut zu versuchen.",
+    "mediaUnavailable": "Audio nicht verfügbar — auf diesem System fehlen die Medienkomponenten für die Tonwiedergabe. Installiere die GStreamer-Plugin-Pakete deiner Distribution und starte die App neu.",
     "mute": "Stummschalten",
     "unmute": "Stummschaltung aufheben",
     "volume": "Lautstärke"
@@ -295,7 +306,15 @@
     "back": "Zurück",
     "settings": "Einstellungen",
     "languageSettings": "Sprache ({{lang}}) — Einstellungen öffnen",
-    "languageTitle": "Sprache: {{lang}}"
+    "languageTitle": "Sprache: {{lang}}",
+    "statusBanner": {
+      "dismiss": "Diese Meldung schließen",
+      "severity": {
+        "info": "Hinweis",
+        "warning": "Achtung",
+        "critical": "Wichtig"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Etwas ist schiefgelaufen",

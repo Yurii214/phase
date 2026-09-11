@@ -13,6 +13,11 @@
 import { createStore, del, get, set } from "idb-keyval";
 
 import type { DraftKind, DraftStatus, PoolInput } from "../adapter/draft-adapter";
+import {
+  isPlainRecord,
+  validateWorkspaceState,
+  type DraftWorkspaceState,
+} from "../components/draft/workspace/types";
 import type { DraftMatchBinding, DraftMatchLaunch, DraftMatchSettlement } from "../network/draftProtocol";
 import { parseRoomCode } from "../network/connection";
 import { ACTIVE_DRAFT_GUEST_KEY, ACTIVE_DRAFT_POD_KEY } from "../constants/storage";
@@ -42,6 +47,9 @@ export interface PersistedDraftHostSession {
   seatNames: Record<number, string>;
   /** Tokens that were kicked — refused on reconnect. */
   kickedTokens: string[];
+  /** Absolute reconnect deadline by seat. An absent field is legacy and cannot
+   * safely establish a new recovery window. */
+  reconnectDeadlines?: Record<number, number>;
   /** Seats whose reconnect grace elapsed while this host owned the pod. */
   expiredDisconnectedSeats?: number[];
   /** Whether StartDraft has been applied. */
@@ -88,6 +96,8 @@ export interface PersistedDraftHostSession {
     submissionId: string;
     payloadFingerprint: string;
   }>;
+  /** Complete, validated workspace state per authoritative seat. */
+  perSeatWorkspaceSnapshots?: Record<number, DraftWorkspaceState>;
 }
 
 /**
@@ -118,6 +128,14 @@ export interface PersistedDraftDeckSubmission {
   draftToken: string;
   submissionId: string;
   mainDeck: string[];
+  /**
+   * CR 903.3: the commander designation this submission carried. Persisted
+   * because `draft_submit_deck` REQUIRES it (draft protocol 17) — a reconnect
+   * replay that omitted it would be refused by `validateSubmitDeck` on the
+   * host, and `draftPeerSession`'s decode `.catch` would drop the frame
+   * silently rather than surfacing an error.
+   */
+  commanders: string[];
   timestamp: number;
 }
 
@@ -128,6 +146,20 @@ export interface ActiveDraftGuestMeta {
   hostPeerId: string;
   timestamp: number;
 }
+
+/** Stable identity of a guest recovery locator read from local storage. */
+export interface ActiveDraftGuestMetaCapture {
+  roomCode: string;
+  displayName: string;
+  hostPeerId: string;
+  timestamp: number;
+}
+
+/** Non-mutating classification for guest recovery callers. */
+export type ActiveDraftGuestLoadResult =
+  | { type: "absent" }
+  | { type: "invalid"; capture: ActiveDraftGuestMetaCapture | null }
+  | { type: "present"; meta: ActiveDraftGuestMeta; capture: ActiveDraftGuestMetaCapture };
 
 export type ActiveDraftPodPhase =
   | "lobby"
@@ -219,7 +251,28 @@ export async function loadDraftHostSession(
       getDraftStore(),
     );
     if (!s) return null;
-    return isPersistedDraftHostSession(s) ? s : null;
+    if (!isPersistedDraftHostSession(s)) return null;
+
+    const snapshots: Record<number, DraftWorkspaceState> = {};
+    if (s.perSeatWorkspaceSnapshots !== undefined) {
+      if (!isPlainRecord(s.perSeatWorkspaceSnapshots)) return null;
+      const rawSnapshots = s.perSeatWorkspaceSnapshots as unknown as Record<PropertyKey, unknown>;
+      for (const key of Reflect.ownKeys(rawSnapshots)) {
+        if (
+          typeof key !== "string"
+          || !Object.prototype.propertyIsEnumerable.call(rawSnapshots, key)
+        ) {
+          return null;
+        }
+        const seat = Number(key);
+        if (!Number.isSafeInteger(seat) || seat < 0 || String(seat) !== key) return null;
+        const snapshot = validateWorkspaceState(rawSnapshots[key]);
+        if ("error" in snapshot) return null;
+        snapshots[seat] = snapshot;
+      }
+    }
+
+    return { ...s, perSeatWorkspaceSnapshots: snapshots };
   } catch {
     return null;
   }
@@ -283,19 +336,56 @@ export function saveActiveDraftGuest(meta: Omit<ActiveDraftGuestMeta, "timestamp
   }));
 }
 
-export function loadActiveDraftGuest(): ActiveDraftGuestMeta | null {
+function activeDraftGuestCapture(value: unknown): ActiveDraftGuestMetaCapture | null {
+  if (!isActiveDraftGuestMeta(value)) return null;
+  return {
+    roomCode: value.roomCode,
+    displayName: value.displayName,
+    hostPeerId: value.hostPeerId,
+    timestamp: value.timestamp,
+  };
+}
+
+/** Inspects the guest recovery locator without removing malformed or expired data. */
+export function inspectActiveDraftGuest(): ActiveDraftGuestLoadResult {
   try {
     const raw = localStorage.getItem(ACTIVE_DRAFT_GUEST_KEY);
-    if (!raw) return null;
+    if (!raw) return { type: "absent" };
     const value: unknown = JSON.parse(raw);
-    if (!isActiveDraftGuestMeta(value) || Date.now() - value.timestamp > GUEST_SESSION_TTL_MS) {
-      clearActiveDraftGuest();
-      return null;
+    if (!isActiveDraftGuestMeta(value)) return { type: "invalid", capture: null };
+    const capture = activeDraftGuestCapture(value);
+    if (!capture || Date.now() - capture.timestamp > GUEST_SESSION_TTL_MS) {
+      return { type: "invalid", capture };
     }
-    return value;
+    return { type: "present", meta: value, capture };
   } catch {
-    clearActiveDraftGuest();
-    return null;
+    return { type: "invalid", capture: null };
+  }
+}
+
+export function loadActiveDraftGuest(): ActiveDraftGuestMeta | null {
+  const active = inspectActiveDraftGuest();
+  if (active.type === "present") return active.meta;
+  if (active.type === "invalid") clearActiveDraftGuest();
+  return null;
+}
+
+/** Clears guest metadata only when it still matches a previously inspected locator. */
+export function clearActiveDraftGuestIfCurrent(capture: ActiveDraftGuestMetaCapture): void {
+  try {
+    const raw = localStorage.getItem(ACTIVE_DRAFT_GUEST_KEY);
+    if (!raw) return;
+    const currentCapture = activeDraftGuestCapture(JSON.parse(raw));
+    if (
+      currentCapture?.roomCode === capture.roomCode
+      && currentCapture.displayName === capture.displayName
+      && currentCapture.hostPeerId === capture.hostPeerId
+      && currentCapture.timestamp === capture.timestamp
+    ) {
+      clearActiveDraftGuest();
+    }
+  } catch {
+    // A malformed replacement is not evidence that this caller owns it.
   }
 }
 
@@ -396,6 +486,7 @@ function isPersistedDraftHostSession(value: unknown): value is PersistedDraftHos
     isSeatStringRecord(value.seatTokens) &&
     isSeatStringRecord(value.seatNames) &&
     Array.isArray(value.kickedTokens) && value.kickedTokens.every((token) => typeof token === "string") &&
+    (value.reconnectDeadlines === undefined || isSeatDeadlineRecord(value.reconnectDeadlines)) &&
     (value.expiredDisconnectedSeats === undefined ||
       (Array.isArray(value.expiredDisconnectedSeats) && value.expiredDisconnectedSeats.every(isNonnegativeInteger))) &&
     typeof value.draftStarted === "boolean" &&
@@ -423,7 +514,23 @@ function isDraftKind(value: unknown): value is Exclude<DraftKind, "Quick"> {
 function isPoolInput(value: unknown): value is PoolInput {
   if (!isRecord(value) || !isRecord(value.data)) return false;
   if (value.type === "Set") {
+    // Two spellings reach here. The live one is a `SetPackSequence`: the
+    // distinct pools plus the pack-ordered sequence naming which fills each
+    // booster. A pod persisted before multi-set pods existed carries one
+    // serialized pool under `set_pool_json`; draft-wasm still promotes that to
+    // the one-element sequence it meant, so a host mid-lobby across the upgrade
+    // resumes instead of having its snapshot discarded as corrupt.
+    if (isSetPackSequence(value.data)) return true;
     return typeof value.data.set_pool_json === "string" && isJsonRecord(value.data.set_pool_json);
+  }
+  if (value.type === "Chaos") {
+    return (
+      Array.isArray(value.data.pools) &&
+      value.data.pools.every(isRecord) &&
+      Array.isArray(value.data.candidate_codes) &&
+      value.data.candidate_codes.length > 0 &&
+      value.data.candidate_codes.every(isNonEmptyString)
+    );
   }
   if (value.type !== "Cube") return false;
   const settings = value.data.cube_draft_settings;
@@ -444,8 +551,30 @@ function isPoolInput(value: unknown): value is PoolInput {
   );
 }
 
+/**
+ * A pack sequence carries one pool object per distinct set and one set code per
+ * booster. The sequence must be non-empty — a pod that named no booster has no
+ * pool at all — and every entry a string, since draft-wasm resolves each
+ * against the supplied pools by name.
+ */
+function isSetPackSequence(data: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(data.pools) &&
+    data.pools.every(isRecord) &&
+    Array.isArray(data.sequence) &&
+    data.sequence.length > 0 &&
+    data.sequence.every((code) => typeof code === "string")
+  );
+}
+
 function isSeatStringRecord(value: unknown): value is Record<number, string> {
   return isRecord(value) && Object.entries(value).every(([seat, token]) => isPositiveSeat(seat) && typeof token === "string");
+}
+
+function isSeatDeadlineRecord(value: unknown): value is Record<number, number> {
+  return isRecord(value) && Object.entries(value).every(
+    ([seat, deadline]) => isPositiveSeat(seat) && isPositiveFiniteNumber(deadline),
+  );
 }
 
 function isPositiveSeat(value: string): boolean {
@@ -577,6 +706,7 @@ export async function saveDraftDeckSubmission(
     draftToken: submission.draftToken,
     submissionId: submission.submissionId,
     mainDeck: [...submission.mainDeck],
+    commanders: [...submission.commanders],
     timestamp: Date.now(),
   };
   await set(`${DRAFT_DECK_SUBMISSION_PREFIX}${hostPeerId}`, value, getDraftStore());
@@ -596,7 +726,12 @@ export async function loadDraftDeckSubmission(
     if (!value || value.hostPeerId !== hostPeerId || !isNonEmptyString(value.draftCode)
       || !isCanonicalRoomCode(value.roomCode)
       || !isNonEmptyString(value.draftToken) || !isNonEmptyString(value.submissionId)
-      || !Array.isArray(value.mainDeck) || !value.mainDeck.every((card) => typeof card === "string")) {
+      || !Array.isArray(value.mainDeck) || !value.mainDeck.every((card) => typeof card === "string")
+      // A record written before the designation existed cannot be replayed:
+      // the host would refuse it. Discarding it is the fail-safe answer — the
+      // guest simply builds a fresh submission.
+      || !Array.isArray(value.commanders)
+      || !value.commanders.every((card) => typeof card === "string")) {
       return null;
     }
     if (identity && (value.roomCode !== roomCode || value.draftToken !== identity.draftToken)) {

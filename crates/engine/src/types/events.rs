@@ -535,6 +535,7 @@ impl EventObjectSnapshot {
             | TargetFilter::LastRevealed
             | TargetFilter::LastZoneChanged
             | TargetFilter::CostPaidObject
+            | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
             | TargetFilter::TrackedSet { .. }
             | TargetFilter::ExiledCardByIndex { .. }
@@ -663,7 +664,7 @@ impl EventObjectSnapshot {
 
             // ---- embedded per-turn history ----
             FilterProp::WasDealtDamageThisTurn
-            | FilterProp::DealtDamageThisTurn
+            | FilterProp::DealtDamageThisTurn { .. }
             | FilterProp::EnteredThisTurn
             | FilterProp::AttackedThisTurn { .. }
             | FilterProp::BlockedThisTurn
@@ -728,6 +729,7 @@ impl EventObjectSnapshot {
             | FilterProp::SameNameAsExiledBySource
             | FilterProp::AttachedToSource
             | FilterProp::AttachedToRecipient
+            | FilterProp::AttachedToPlayer { .. }
             | FilterProp::Unpaired
             | FilterProp::OtherThanTriggerObject
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
@@ -764,6 +766,13 @@ pub enum GameEvent {
     TurnStarted {
         player_id: PlayerId,
         turn_number: u32,
+    },
+    /// CR 500.7: One extra turn was created after the turn identified by
+    /// `anchor`; `player_id` is the beneficiary. CR 805.8: In a shared-team-turn
+    /// game, both ids are the corresponding shared-turn representatives.
+    ExtraTurnCreated {
+        player_id: PlayerId,
+        anchor: PlayerId,
     },
     PhaseChanged {
         phase: Phase,
@@ -1041,6 +1050,21 @@ pub enum GameEvent {
         /// you to discard this card" can resolve the cause's controller.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<ObjectId>,
+    },
+    /// CR 701.17a: a card was milled — the milling player put it from the top of
+    /// their library toward their graveyard. Emitted once per card (CR 603.2c),
+    /// and emitted even when a replacement rewrote the destination: CR 614.6 says
+    /// the modified event is what occurred, and CR 701.17c confirms the card is
+    /// still a milled card by letting an effect find it "in the zone it moved to
+    /// from the library". `to` is that post-replacement zone, which CR 701.17c
+    /// scopes on being public (CR 400.2) — the wire visibility filter reads it.
+    Milled {
+        /// CR 701.17a: the player whose library the card left.
+        player_id: PlayerId,
+        /// The milled card.
+        object_id: ObjectId,
+        /// CR 701.17c: the zone the card actually moved to from the library.
+        to: Zone,
     },
     DamageCleared {
         object_id: ObjectId,
@@ -1580,9 +1604,16 @@ pub enum GameEvent {
         kind: StickerKind,
     },
     /// CR 701.52: The active player rolled to visit their Attractions.
+    ///
+    /// CR 701.52a specifies ONE roll-to-visit turn-based action, so this event
+    /// is emitted ONCE per action even when a CR 706.6 count-raising replacement
+    /// (Barbarian Class, Pixie Guide, Wyll) leaves more than one surviving die.
+    /// `rolls` therefore carries every SURVIVING result, in roll order — an
+    /// ignored roll never happened (CR 706.6) and never appears here. Visiting
+    /// is still decided per result (`AttractionVisited`, one per visit).
     AttractionsRolledToVisit {
         player_id: PlayerId,
-        roll: u8,
+        rolls: Vec<u8>,
     },
     /// CR 701.52a + CR 702.159a: A specific Attraction was visited this roll.
     AttractionVisited {
@@ -1647,10 +1678,14 @@ pub enum GameEvent {
         is_mana_ability: bool,
     },
 
-    /// CR 702.110: A creature exploited another creature (sacrificed via exploit ETB).
+    /// CR 702.110b + CR 603.10a + CR 400.7: A creature exploited another
+    /// creature. `exploiter` identifies the actor, while `record` preserves the
+    /// sacrificed victim's exact pre-departure characteristics for later
+    /// trigger matching after the victim has become a new object.
     CreatureExploited {
         exploiter: ObjectId,
         sacrificed: ObjectId,
+        record: Box<ZoneChangeRecord>,
     },
     /// CR 122.1: A player's energy counter total changed.
     EnergyChanged {
@@ -1780,6 +1815,22 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "TurnStarted");
         assert_eq!(json["data"]["turn_number"], 1);
+    }
+
+    #[test]
+    fn extra_turn_created_serializes_with_normalized_record_identity() {
+        let event = GameEvent::ExtraTurnCreated {
+            player_id: PlayerId(2),
+            anchor: PlayerId(5),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "ExtraTurnCreated");
+        assert_eq!(json["data"]["player_id"], 2);
+        assert_eq!(json["data"]["anchor"], 5);
+
+        let round_tripped: GameEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, event);
     }
 
     #[test]

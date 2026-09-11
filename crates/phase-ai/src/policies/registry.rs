@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::activation_patience::ActivationPatiencePolicy;
 use super::aggro_pressure::AggroPressurePolicy;
 use super::anthem_priority::AnthemPriorityPolicy;
 use super::anti_self_harm::AntiSelfHarmPolicy;
@@ -11,6 +12,7 @@ use super::chalice_avoidance::ChaliceAvoidancePolicy;
 use super::combat_withdrawal::CombatWithdrawalPolicy;
 use super::context::{PolicyContext, PriorsEnv};
 use super::copy_value::CopyValuePolicy;
+use super::creature_type_choice::CreatureTypeChoicePolicy;
 use super::crew_timing::CrewTimingPolicy;
 use super::cycling_discipline::CyclingDisciplinePolicy;
 use super::devotion::DevotionPolicy;
@@ -27,6 +29,7 @@ use super::landfall_timing::LandfallTimingPolicy;
 use super::lethality_awareness::LethalityAwarenessPolicy;
 use super::life_total_resource::LifeTotalResourcePolicy;
 use super::loop_shortcut::LoopShortcutPolicy;
+use super::momir_curve::MomirCurvePolicy;
 use super::payment_selection::PaymentSelectionPolicy;
 use super::payoff::{
     PayoffPolicy, ARTIFACT_SYNERGY, BLINK_PAYOFF, ENCHANTMENTS_PAYOFF, ENERGY_PAYOFF,
@@ -63,6 +66,7 @@ use engine::types::player::PlayerId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PolicyId {
     AntiSelfHarm,
+    MomirCurve,
     ArtifactSynergyTactical,
     BoardDevelopment,
     EtbValue,
@@ -101,6 +105,7 @@ pub enum PolicyId {
     SweeperTiming,
     FreeOutletActivation,
     FetchLandPatience,
+    ActivationPatience,
     AristocratsKeepablesMulligan,
     AggroPressure,
     AggroKeepablesMulligan,
@@ -119,6 +124,9 @@ pub enum PolicyId {
     SacrificeCostManaGate,
     SacrificeLandProtection,
     SelfCostValue,
+    /// CR 605.3a + CR 106.4: activating "{N}: Untap this" on an already-untapped
+    /// mana rock (Basalt Monolith class) — a self-funded, net-zero loop.
+    SelfUntapLoop,
     ComboLineProgress,
     CedhKeepablesMulligan,
     FixedDeckKeepMulligan,
@@ -161,6 +169,16 @@ pub enum PolicyId {
     DiscardPayoff,
     /// CR 702.122a: cast a Vehicle when the board can actually crew it.
     VehicleDeployment,
+    /// CR 205.3m: pick a creature type the AI actually has members of, instead
+    /// of the alphabetically first option the engine offers.
+    CreatureTypeChoice,
+    /// CR 700.3a: every eligible object goes in exactly one pile; split them
+    /// into two piles of equal value, since the adversary chooses which pile
+    /// the AI ends up with.
+    PilePartition,
+    /// CR 106.4: a ritual's mana empties at end of step/phase — don't cast one
+    /// when nothing in reach can spend it in this window.
+    RitualSink,
 }
 
 /// Coarse routing kind for a candidate decision. Each policy declares which
@@ -383,7 +401,9 @@ impl Default for PolicyRegistry {
             Box::new(HoldManaUpForInteractionPolicy),
             Box::new(SweeperTimingPolicy),
             Box::new(FreeOutletActivationPolicy),
+            Box::new(MomirCurvePolicy),
             Box::new(FetchLandPatiencePolicy),
+            Box::new(ActivationPatiencePolicy),
             Box::new(AggroPressurePolicy),
             Box::new(TokensWidePolicy),
             Box::new(AnthemPriorityPolicy),
@@ -394,6 +414,7 @@ impl Default for PolicyRegistry {
             Box::new(SacrificeCostManaGatePolicy),
             Box::new(SacrificeLandProtectionPolicy),
             Box::new(SelfCostValuePolicy),
+            Box::new(super::self_untap_loop::SelfUntapLoopPolicy),
             Box::new(super::combo_line::ComboLinePolicy::new()),
             Box::new(super::planeswalker_loyalty::PlaneswalkerLoyaltyPolicy),
             Box::new(super::equipment_priority::EquipmentPriorityPolicy),
@@ -421,6 +442,9 @@ impl Default for PolicyRegistry {
             Box::new(super::draw_payoff::DrawPayoffPolicy),
             Box::new(super::discard_payoff::DiscardPayoffPolicy),
             Box::new(super::vehicle_deployment::VehicleDeploymentPolicy),
+            Box::new(CreatureTypeChoicePolicy),
+            Box::new(super::pile_partition::PilePartitionPolicy),
+            Box::new(super::ritual_sink::RitualSinkPolicy),
         ];
         Self::from_policies(policies)
     }

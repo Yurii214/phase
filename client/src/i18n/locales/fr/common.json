@@ -5,6 +5,10 @@
     "close": "Fermer",
     "closeNamed": "Fermer {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Exporter l’état de jeu faisant autorité",
+    "exportAuthoritativeTitle": "Télécharge l’état détenu par le moteur, utilisé pour diagnostiquer et restaurer cette partie"
+  },
   "quantityRef": {
     "highestNumber": "le nombre le plus élevé",
     "lowestNumber": "le nombre le plus bas",
@@ -20,7 +24,7 @@
   },
   "pausedBanner": {
     "message": "Partie en pause — {{reason}}",
-    "resume": "Reprendre"
+    "resume": "Reprendre la partie"
   },
   "fullscreen": {
     "enter": "Passer en plein écran",
@@ -58,10 +62,15 @@
     "updateIssue": "problème de mise à jour",
     "updated": "à jour"
   },
+  "offlineBadge": {
+    "label": "Hors ligne",
+    "servicesPaused": "Les mises à jour et services en ligne sont suspendus.",
+    "forced": "Travailler hors ligne est activé.",
+    "connection": "Aucune connexion réseau."
+  },
   "comboDetector": {
     "label": "Détecteur de combos (expérimental)",
     "title": "Détecter les boucles infinies : terminer automatiquement les boucles obligatoires et afficher les ressources ∞ (désactivé par défaut)",
-    "on": "Activé",
     "off": "Désactivé",
     "interactive": "Interactif"
   },
@@ -79,7 +88,8 @@
     "clickModeButton": "Bouton mode clic",
     "shown": "Affiché",
     "hidden": "Masqué",
-    "resume": "Reprendre",
+    "openGameLog": "Ouvrir le journal de partie",
+    "closeGameLog": "Fermer le journal de partie",
     "settings": "Paramètres",
     "boardLayoutSplit": "Divisé",
     "boardLayoutLegacy": "Legacy",
@@ -103,6 +113,7 @@
   },
   "volume": {
     "deviceBlocked": "Audio indisponible — le serveur audio du système ne répond pas. Redémarrez l'application pour réessayer.",
+    "mediaUnavailable": "Audio indisponible — les composants multimédias nécessaires à la lecture du son sont absents de ce système. Installez les paquets de greffons GStreamer de votre distribution, puis redémarrez l'application.",
     "mute": "Couper le son",
     "unmute": "Rétablir le son",
     "volume": "Volume"
@@ -295,7 +306,15 @@
     "back": "Retour",
     "settings": "Paramètres",
     "languageSettings": "Langue ({{lang}}) — ouvrir les paramètres",
-    "languageTitle": "Langue : {{lang}}"
+    "languageTitle": "Langue : {{lang}}",
+    "statusBanner": {
+      "dismiss": "Ignorer ce message",
+      "severity": {
+        "info": "Information",
+        "warning": "Attention",
+        "critical": "Important"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Une erreur est survenue",

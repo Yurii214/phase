@@ -3,6 +3,10 @@ use tauri::{Manager, WebviewWindowBuilder};
 
 mod audio_probe;
 mod host_platform;
+#[cfg(desktop)]
+mod lan;
+#[cfg(target_os = "linux")]
+mod media_stack;
 mod migration;
 mod mobile_compat;
 #[cfg(desktop)]
@@ -10,7 +14,8 @@ mod native_bridge;
 #[cfg(desktop)]
 mod native_engine;
 mod native_engine_contract;
-
+#[cfg(desktop)]
+mod update_authority;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebKitGTK's dmabuf renderer renders blank frames when the GPU import
@@ -23,6 +28,16 @@ pub fn run() {
     if std::env::var_os("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_none() {
         std::env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
     }
+
+    // WebKitGTK has no audio stack of its own — every AudioContext and every
+    // decodeAudioData is a GStreamer pipeline it assembles from plugin
+    // libraries. A missing plugin set leaves the decode promise the page
+    // awaits unsettled rather than rejected, so the user sees a frozen
+    // loading screen with no explanation. Say why here, before the webview
+    // exists, so the reason is the first thing in the terminal. Diagnostic
+    // only: the page's own audio phase is deadline-bounded and boots anyway.
+    #[cfg(target_os = "linux")]
+    media_stack::report_to_stderr();
 
     let builder = tauri::Builder::default().plugin(
         tauri_plugin_opener::Builder::new()
@@ -37,8 +52,22 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // The plugin stays registered everywhere so the `check()` command the
+        // web app calls always exists — an unregistered plugin rejects the
+        // call, and client/src/pwa/tauriUpdater.ts surfaces that rejection as a
+        // visible update error. Refusing the release instead resolves to "no
+        // update available", which that same lifecycle already treats as the
+        // quiet, healthy outcome.
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .default_version_comparator(|current, candidate| {
+                    update_authority::UpdateAuthority::detect()
+                        .should_install(&current, &candidate.version)
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             audio_probe::audio_boot_health,
             host_platform::host_platform,
@@ -48,11 +77,21 @@ pub fn run() {
             migration::confirm_legacy_import,
             migration::mark_remote_load_ok,
             native_engine::ensure_native_engine,
+            native_engine::native_engine_capabilities,
             native_engine::native_engine_progress,
             native_engine::stop_native_engine,
             native_bridge::connect_native_engine,
             native_bridge::native_engine_bridge_send,
-            native_bridge::native_engine_bridge_close
+            native_bridge::native_engine_bridge_close,
+            lan::lan_capabilities,
+            lan::start_lan_server,
+            lan::lan_server_status,
+            lan::stop_lan_server,
+            lan::discover_lan_servers,
+            native_bridge::authorize_lan_server,
+            native_bridge::connect_lan_server,
+            native_bridge::lan_bridge_send,
+            native_bridge::lan_bridge_close
         ]);
 
     #[cfg(mobile)]
@@ -65,6 +104,7 @@ pub fn run() {
         migration::confirm_legacy_import,
         migration::mark_remote_load_ok,
         mobile_compat::ensure_native_engine,
+        mobile_compat::native_engine_capabilities,
         mobile_compat::native_engine_progress,
         mobile_compat::stop_native_engine,
         mobile_compat::connect_native_engine,
@@ -99,6 +139,7 @@ pub fn run() {
                 let builder =
                     WebviewWindowBuilder::from_config(app, main_config)?.on_navigation(|_| {
                         native_engine::abort_native_engine_bridges_on_navigation();
+                        native_bridge::abort_lan_bridges();
                         true
                     });
                 #[cfg(target_os = "windows")]
@@ -117,6 +158,8 @@ pub fn run() {
     app.run(|app, event| {
         #[cfg(desktop)]
         if let tauri::RunEvent::Exit = event {
+            native_bridge::abort_lan_bridges();
+            let _ = native_engine::stop_lan_server_sync();
             native_engine::stop_native_engine_on_exit(app);
         }
         #[cfg(mobile)]
@@ -130,6 +173,8 @@ mod tests {
 
     use serde_json::{json, Value};
     use tauri::utils::{config::parse::read_from, platform::Target};
+
+    type ConfigMutation = Box<dyn Fn(&mut Value)>;
 
     fn android_overlay_value() -> Value {
         serde_json::from_str(include_str!("../tauri.android.conf.json")).unwrap()
@@ -255,6 +300,76 @@ mod tests {
         assert!(window.maximized);
     }
 
+    /// `update_authority` reaches the running app through exactly one call: the
+    /// updater plugin's version comparator. Drop that call and the module still
+    /// compiles, its own unit tests still pass, and self-update is silently
+    /// restored inside the Flatpak sandbox, where `/app` is read-only. No test
+    /// of the module can observe that, so pin the wiring here — the same reason
+    /// the generated Android Gradle invariants are pinned below.
+    #[test]
+    fn updater_plugin_defers_to_the_update_authority() {
+        // Only the production half of this file, because the needles below are
+        // themselves string literals in this module: matching the whole file
+        // would match the test's own array and pass with the wiring deleted.
+        let source = include_str!("lib.rs")
+            .split("mod tests")
+            .next()
+            .expect("split always yields a first element");
+        for required in [
+            "tauri_plugin_updater::Builder::new()",
+            ".default_version_comparator(",
+            "update_authority::UpdateAuthority::detect()",
+            ".should_install(",
+        ] {
+            assert!(
+                source.contains(required),
+                "updater registration lost required invariant: {required}"
+            );
+        }
+    }
+
+    /// Flatpak keys the desktop entry, the icons and the AppStream component on
+    /// the app-id, and Tauri names the window's WM class from the identifier.
+    /// If the two drift the package still builds and installs, but launches
+    /// into an unmatched window with no icon, so pin them together.
+    #[test]
+    fn flatpak_manifest_app_id_matches_the_tauri_identifier() {
+        let identifier = serde_json::from_str::<tauri::Config>(include_str!("../tauri.conf.json"))
+            .unwrap()
+            .identifier;
+        let manifest = include_str!("../../../packaging/flatpak/rs.phase.app.yml");
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.trim() == format!("app-id: {identifier}")),
+            "packaging/flatpak/rs.phase.app.yml must declare app-id: {identifier}"
+        );
+        for asset in [
+            include_str!("../../../packaging/flatpak/rs.phase.app.desktop"),
+            include_str!("../../../packaging/flatpak/rs.phase.app.metainfo.xml"),
+        ] {
+            assert!(
+                asset.contains(&identifier),
+                "flatpak asset must reference the {identifier} app-id"
+            );
+        }
+        // Flatpak exports a desktop entry, an icon and a metainfo component only
+        // when each is installed under the app-id name, so the install
+        // destinations are the part that actually decides whether the launcher
+        // works. Declaring the right app-id while installing to the old file
+        // names silently exports nothing.
+        for destination in [
+            format!("{identifier}.desktop"),
+            format!("{identifier}.metainfo.xml"),
+            format!("{identifier}.png"),
+        ] {
+            assert!(
+                manifest.contains(&destination),
+                "rs.phase.app.yml must install {destination} for flatpak to export it"
+            );
+        }
+    }
+
     #[test]
     fn android_config_uses_tauri_rfc7396_merge_and_exact_typed_values() {
         assert_eq!(android_overlay_value(), expected_android_overlay());
@@ -359,24 +474,72 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("gen/android/app/src/main");
         let launchers = [
             ("res/mipmap-mdpi/ic_launcher.png", 48, 0x5c1ab8a4b9388839),
-            ("res/mipmap-mdpi/ic_launcher_round.png", 48, 0x59147ebcc4d03aee),
-            ("res/mipmap-mdpi/ic_launcher_foreground.png", 108, 0x7475638e0402146d),
+            (
+                "res/mipmap-mdpi/ic_launcher_round.png",
+                48,
+                0x59147ebcc4d03aee,
+            ),
+            (
+                "res/mipmap-mdpi/ic_launcher_foreground.png",
+                108,
+                0x7475638e0402146d,
+            ),
             ("res/mipmap-hdpi/ic_launcher.png", 72, 0x6617db678c75ce93),
-            ("res/mipmap-hdpi/ic_launcher_round.png", 72, 0x4f89bf39172434e8),
-            ("res/mipmap-hdpi/ic_launcher_foreground.png", 162, 0x117a6af2e6fc0ba6),
+            (
+                "res/mipmap-hdpi/ic_launcher_round.png",
+                72,
+                0x4f89bf39172434e8,
+            ),
+            (
+                "res/mipmap-hdpi/ic_launcher_foreground.png",
+                162,
+                0x117a6af2e6fc0ba6,
+            ),
             ("res/mipmap-xhdpi/ic_launcher.png", 96, 0x093ba5f2f7965ec2),
-            ("res/mipmap-xhdpi/ic_launcher_round.png", 96, 0x4b3df36bd3042bc2),
-            ("res/mipmap-xhdpi/ic_launcher_foreground.png", 216, 0xf53f6d79f95ca531),
+            (
+                "res/mipmap-xhdpi/ic_launcher_round.png",
+                96,
+                0x4b3df36bd3042bc2,
+            ),
+            (
+                "res/mipmap-xhdpi/ic_launcher_foreground.png",
+                216,
+                0xf53f6d79f95ca531,
+            ),
             ("res/mipmap-xxhdpi/ic_launcher.png", 144, 0xff0c47390df3221d),
-            ("res/mipmap-xxhdpi/ic_launcher_round.png", 144, 0xd35d38485496323b),
-            ("res/mipmap-xxhdpi/ic_launcher_foreground.png", 324, 0x67326e67177dc7d1),
-            ("res/mipmap-xxxhdpi/ic_launcher.png", 192, 0x8392d43e0239107d),
-            ("res/mipmap-xxxhdpi/ic_launcher_round.png", 192, 0x1d2a7149b7716eff),
-            ("res/mipmap-xxxhdpi/ic_launcher_foreground.png", 432, 0x361ec69b50f865b4),
+            (
+                "res/mipmap-xxhdpi/ic_launcher_round.png",
+                144,
+                0xd35d38485496323b,
+            ),
+            (
+                "res/mipmap-xxhdpi/ic_launcher_foreground.png",
+                324,
+                0x67326e67177dc7d1,
+            ),
+            (
+                "res/mipmap-xxxhdpi/ic_launcher.png",
+                192,
+                0x8392d43e0239107d,
+            ),
+            (
+                "res/mipmap-xxxhdpi/ic_launcher_round.png",
+                192,
+                0x1d2a7149b7716eff,
+            ),
+            (
+                "res/mipmap-xxxhdpi/ic_launcher_foreground.png",
+                432,
+                0x361ec69b50f865b4,
+            ),
         ];
         for (relative, expected_size, expected_hash) in launchers {
             let bytes = fs::read(root.join(relative)).unwrap();
-            assert_eq!(png_dimensions(&bytes), (expected_size, expected_size), "{relative}");
+            assert_eq!(
+                png_dimensions(&bytes),
+                (expected_size, expected_size),
+                "{relative}"
+            );
             assert_eq!(fnv1a64(&bytes), expected_hash, "{relative}");
         }
 
@@ -405,7 +568,10 @@ mod tests {
             "res/drawable/ic_launcher_background.xml",
             "res/drawable-v24/ic_launcher_foreground.xml",
         ] {
-            assert!(!root.join(obsolete_stock_asset).exists(), "{obsolete_stock_asset}");
+            assert!(
+                !root.join(obsolete_stock_asset).exists(),
+                "{obsolete_stock_asset}"
+            );
         }
     }
 
@@ -413,7 +579,7 @@ mod tests {
     fn every_android_config_mutation_is_rejected_and_the_positive_is_restored() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let base = include_str!("../tauri.conf.json");
-        let mut cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        let mut cases: Vec<(&str, ConfigMutation)> = vec![
             (
                 "delete createUpdaterArtifacts",
                 Box::new(|v| {
@@ -594,6 +760,7 @@ mod tests {
                 "process:allow-exit",
                 "process:allow-restart",
                 "updater:default",
+                "allow-lan",
             ])
         );
         for capability in [common_local, common_remote] {
@@ -602,6 +769,7 @@ mod tests {
             assert!(!permissions.contains("process:allow-exit"));
             assert!(!permissions.contains("process:allow-restart"));
             assert!(!permissions.contains("updater:default"));
+            assert!(!permissions.contains("allow-lan"));
         }
         for required in [
             "allow-host-platform",
@@ -616,6 +784,10 @@ mod tests {
         let app_permissions = acl_manifests["__app-acl__"]["permissions"]
             .as_object()
             .unwrap();
+        assert_eq!(
+            app_permissions["allow-ensure-native-engine"]["commands"]["allow"],
+            json!(["ensure_native_engine", "native_engine_capabilities"])
+        );
         for capability in [common_local, common_remote] {
             for permission in capability_permissions(capability) {
                 if permission.starts_with("allow-") {

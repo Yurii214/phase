@@ -5,6 +5,10 @@
     "close": "Fechar",
     "closeNamed": "Fechar {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Exportar estado de jogo autoritativo",
+    "exportAuthoritativeTitle": "Baixa o estado controlado pelo mecanismo usado para diagnosticar e restaurar este jogo"
+  },
   "quantityRef": {
     "highestNumber": "o número mais alto",
     "lowestNumber": "o número mais baixo",
@@ -20,7 +24,7 @@
   },
   "pausedBanner": {
     "message": "Jogo pausado — {{reason}}",
-    "resume": "Retomar"
+    "resume": "Retomar jogo"
   },
   "fullscreen": {
     "enter": "Entrar em tela cheia",
@@ -58,10 +62,15 @@
     "updateIssue": "problema na atualização",
     "updated": "atualizado"
   },
+  "offlineBadge": {
+    "label": "Offline",
+    "servicesPaused": "As atualizações e os serviços online estão pausados.",
+    "forced": "Trabalhar offline está ativado.",
+    "connection": "Sem conexão de rede."
+  },
   "comboDetector": {
     "label": "Detector de combos (experimental)",
     "title": "Detectar loops infinitos: encerrar loops obrigatórios automaticamente e mostrar recursos ∞ (desativado por padrão)",
-    "on": "Ligado",
     "off": "Desligado",
     "interactive": "Interativo"
   },
@@ -79,7 +88,8 @@
     "clickModeButton": "Botão de modo de clique",
     "shown": "Visível",
     "hidden": "Oculto",
-    "resume": "Continuar",
+    "openGameLog": "Abrir o registro do jogo",
+    "closeGameLog": "Fechar o registro do jogo",
     "settings": "Configurações",
     "boardLayoutSplit": "Dividido",
     "boardLayoutLegacy": "Legacy",
@@ -103,6 +113,7 @@
   },
   "volume": {
     "deviceBlocked": "Áudio indisponível — o servidor de áudio do sistema não responde. Reinicie o aplicativo para tentar novamente.",
+    "mediaUnavailable": "Áudio indisponível — faltam neste sistema os componentes de mídia necessários para reproduzir som. Instale os pacotes de plugins do GStreamer da sua distribuição e reinicie o aplicativo.",
     "mute": "Silenciar",
     "unmute": "Reativar som",
     "volume": "Volume"
@@ -295,7 +306,15 @@
     "back": "Voltar",
     "settings": "Configurações",
     "languageSettings": "Idioma ({{lang}}) — abrir configurações",
-    "languageTitle": "Idioma: {{lang}}"
+    "languageTitle": "Idioma: {{lang}}",
+    "statusBanner": {
+      "dismiss": "Dispensar esta mensagem",
+      "severity": {
+        "info": "Aviso",
+        "warning": "Atenção",
+        "critical": "Importante"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Algo deu errado",

@@ -14,15 +14,18 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
+use crate::game::ability_utils::{choose_target_for_ability, TargetSelectionAdvance};
 use crate::game::casting;
 use crate::game::casting_costs;
 use crate::game::layers;
 use crate::game::mana_abilities;
 use crate::game::mana_payment;
 use crate::game::mana_sources;
+use crate::game::restrictions;
 use crate::game::triggers;
 use crate::types::ability::{
-    AbilityKind, CounterCostSelection, TapCreaturesSelectionMode, TargetRef, TriggerDefinition,
+    AbilityBlockEntry, AbilityKind, CounterCostSelection, TapCreaturesSelectionMode, TargetRef,
+    TriggerDefinition,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
@@ -37,17 +40,23 @@ use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
+/// The engine owns copy-source enumeration: which zone the filter names
+/// (`FilterProp::InZone`, battlefield by default), the `ExiledCardByIndex`
+/// resolution, the source exclusion, and the mana-value ceiling. Surfaced here
+/// beside the other copy accessors so AI policies ask that single authority
+/// instead of re-deriving a battlefield scan.
+pub use crate::game::engine_replacement::find_copy_targets;
 pub(crate) use candidates::power_threshold_witness;
 pub use candidates::{
-    candidate_actions, candidate_actions_broad, candidate_actions_exact,
+    balanced_pile_partition, candidate_actions, candidate_actions_broad, candidate_actions_exact,
     candidate_actions_with_probe, retarget_actions, ActionMetadata, CandidateAction, TacticalClass,
 };
 pub use combat_withdrawal::{
     combat_withdrawal_fact_for_current_target, CombatWithdrawalFact, CombatWithdrawalTargetRole,
 };
 pub use context::{
-    build_decision_context, build_decision_context_for_semantic_owner, AiDecisionContext,
-    AiDecisionContract,
+    apply_ai_action_proposal, build_decision_context, build_decision_context_for_semantic_owner,
+    AiDecisionContext, AiDecisionContract, AiProposalApplication,
 };
 pub use copy::{
     copy_effect_adds_flying, copy_target_filter, copy_target_mana_value_ceiling,
@@ -60,9 +69,15 @@ pub use filter::{
     BasicLegalityFilter, CandidateFilter, FilterCost, FilterPipeline, SimulationFilter,
 };
 pub use payment_continuation::{
-    classify_payment_continuation, witness_payment_continuation, AcceptedPaymentSuccessor,
-    PaymentContinuationRoot, PaymentContinuationState, PaymentContinuationUnsupported,
-    PAYMENT_CONTINUATION_MAX_REDUCER_ATTEMPTS,
+    classify_payment_continuation, witness_payment_continuation, witness_payment_continuations,
+    AcceptedPaymentSuccessor, PaymentContinuationBatch, PaymentContinuationBatchStatus,
+    PaymentContinuationIndeterminate, PaymentContinuationRoot, PaymentContinuationState,
+    PaymentContinuationUnsupported, PAYMENT_CONTINUATION_MAX_REDUCER_ATTEMPTS,
+    PAYMENT_CONTINUATION_MAX_ROOTS,
+};
+#[cfg(feature = "test-support")]
+pub use payment_continuation::{
+    witness_payment_continuations_with_counters, PaymentContinuationWitnessCounters,
 };
 pub use prospective_mana::{
     certify_fetch_then_cast, certify_pact_plan, is_pact_payment_ability, is_pact_payment_cast,
@@ -449,6 +464,8 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
             let mut sideboard_counts: HashMap<usize, usize> = HashMap::new();
             let mut exile_seen: HashSet<ObjectId> = HashSet::new();
             let mut exile_dup = false;
+            let mut pack_slots_seen: HashSet<usize> = HashSet::new();
+            let mut pack_slot_dup = false;
             for selection in selections {
                 match selection {
                     OutsideGameSelection::Sideboard { sideboard_index } => {
@@ -457,6 +474,11 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
                     OutsideGameSelection::FaceUpExile { object_id } => {
                         if !exile_seen.insert(*object_id) {
                             exile_dup = true;
+                        }
+                    }
+                    OutsideGameSelection::BoosterPack { pack_slot } => {
+                        if !pack_slots_seen.insert(*pack_slot) {
+                            pack_slot_dup = true;
                         }
                     }
                 }
@@ -480,7 +502,13 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
                     OutsideGameChoiceSource::FaceUpExile { object_id: oid } if oid == object_id
                 ))
                 });
-            !valid_count || exile_dup || bad_sideboard || bad_exile
+            let bad_pack_slot = pack_slots_seen.iter().any(|pack_slot| {
+                !choices.iter().any(|choice| matches!(
+                    &choice.source,
+                    OutsideGameChoiceSource::BoosterPack { pack_slot: slot, .. } if slot == pack_slot
+                ))
+            });
+            !valid_count || exile_dup || pack_slot_dup || bad_sideboard || bad_exile || bad_pack_slot
         }
         (WaitingFor::PairChoice { choices, .. }, GameAction::ChoosePair { partner }) => {
             partner.is_some_and(|partner| !choices.contains(&partner))
@@ -1256,6 +1284,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         | GameAction::SelectCards { .. }
         | GameAction::ChooseRemoveCounterCostDistribution { .. }
         | GameAction::SelectCoinFlips { .. }
+        | GameAction::SelectDieRolls { .. }
         | GameAction::ChooseOutsideGameCards { .. }
         | GameAction::SelectTargets { .. }
         | GameAction::ChooseTarget { .. }
@@ -1295,6 +1324,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         | GameAction::CastSpellAsMiracle { .. }
         | GameAction::CastSpellAsMadness { .. }
         | GameAction::DecideOptionalEffect { .. }
+        | GameAction::ChooseResolutionOptionalPaymentBranch { .. }
         | GameAction::RespondToSpliceOffer { .. }
         | GameAction::DecideOptionalEffectAndRemember { .. }
         | GameAction::PayUnlessCost { .. }
@@ -1912,6 +1942,17 @@ pub fn auto_pass_recommended(state: &GameState, actions: &[GameAction]) -> bool 
         return false;
     }
 
+    // CR 117.1: Full Control is a standing refusal to give up ANY window, so no
+    // recommendation is ever issued. Deliberately ABOVE the CR 117.3d yield rung
+    // below — that rung is the one other place this function can answer `true`
+    // over a hold, and the engine-side gates in `game::engine` (which cover
+    // passes that never reach a frontend) do not consult yields. Ordering Full
+    // Control first is what keeps the recommendation and the authoritative loop
+    // from disagreeing about the same window.
+    if state.priority_passing_mode(mode_owner) == PriorityPassingMode::FullControl {
+        return false;
+    }
+
     // CR 117.3d: A standing priority yield for the top-of-stack trigger is an
     // explicit pre-commitment to pass. It deliberately overrides the castability
     // and meaningful-action holds below (including the issue #4388 opponent-turn
@@ -2185,6 +2226,46 @@ fn target_selection_actions_without_simulation(state: &GameState) -> Option<Vec<
     Some(actions)
 }
 
+/// Returns target choices that cannot complete target declaration without
+/// cloning the game state. Terminal choices and cancellation remain on the
+/// validation pipeline because they can immediately advance into cost payment.
+fn target_selection_actions_with_nonterminal_fast_path(
+    state: &GameState,
+) -> Option<Vec<GameAction>> {
+    let WaitingFor::TargetSelection {
+        pending_cast,
+        target_slots,
+        selection,
+        ..
+    } = &state.waiting_for
+    else {
+        return None;
+    };
+
+    let pipeline = FilterPipeline::default_pipeline();
+    let mut actions = Vec::new();
+    for candidate in candidate_actions(state) {
+        let advances_without_completion = match &candidate.action {
+            GameAction::ChooseTarget { target } => matches!(
+                choose_target_for_ability(
+                    state,
+                    &pending_cast.ability,
+                    target_slots,
+                    &pending_cast.target_constraints,
+                    selection,
+                    target.clone(),
+                ),
+                Ok(TargetSelectionAdvance::InProgress(_))
+            ),
+            _ => false,
+        };
+        if advances_without_completion || pipeline.accepts(state, &candidate) {
+            actions.push(candidate.action);
+        }
+    }
+    Some(actions)
+}
+
 /// The flat priority-action list: validated candidate actions minus mana
 /// abilities. This is the single authority for the non-target-selection action
 /// body so the auto-pass probe (`priority_player_has_meaningful_action`) and
@@ -2244,10 +2325,12 @@ pub fn legal_actions_full(state: &GameState) -> LegalActionsFull {
 
     let mut actions: Vec<GameAction> =
         if context::target_selection_requires_reducer_validation(state) {
-            validated_candidate_actions(state)
-                .into_iter()
-                .map(|candidate| candidate.action)
-                .collect()
+            target_selection_actions_with_nonterminal_fast_path(state).unwrap_or_else(|| {
+                validated_candidate_actions(state)
+                    .into_iter()
+                    .map(|candidate| candidate.action)
+                    .collect()
+            })
         } else {
             target_selection_actions_without_simulation(state)
                 .unwrap_or_else(|| flat_priority_actions_with_probe(state, priority_probe))
@@ -2427,6 +2510,307 @@ pub fn legal_actions_for_viewer(state: &GameState, viewer: PlayerId) -> LegalAct
         legal_actions_full(state)
     } else {
         (Vec::new(), HashMap::new(), HashMap::new())
+    }
+}
+
+/// CR 118.3: maximum TOTAL read-out entries summed across every object bucket
+/// in one `activation_block_reasons` result.
+///
+/// **On the total, NOT the key count.** The map is vector-valued
+/// (`ObjectId -> Vec<AbilityBlockEntry>`), so its correct sibling is
+/// `MAX_SNAPSHOT_LEGAL_ACTIONS_BY_OBJECT_TOTAL`, whose guard sums
+/// `map.values().map(Vec::len).sum()` — NOT `MAX_SNAPSHOT_SPELL_COSTS`, which is
+/// a key-count bound and is complete only because `spell_costs` holds one scalar
+/// per key. A key-count bound here would leave every per-object vector
+/// unbounded, which is the exact failure class this read-out's design exists to
+/// avoid.
+///
+/// The bound lives in the ENGINE rather than in `server-core`'s wire guard
+/// because the guard returns `Result` and a broadcast site drops the whole
+/// message on `Err` — so a bound on a DISPLAY map could suppress a FUNCTIONAL
+/// broadcast. `activation_block_reasons` truncates and returns a map instead:
+/// it has no failure mode, so that path is never constructed. CLAUDE.md also
+/// puts logic in the engine and keeps the transport a serialization boundary.
+///
+/// The value is generous by design: the read-out covers ONE seat across five
+/// zones, so a real board produces tens of entries, not thousands.
+pub const MAX_ACTIVATION_BLOCK_TOTAL: usize = 1_000;
+
+/// CR 118.3: collect one object's unaffordable non-mana activated abilities.
+///
+/// Mirrors the per-object filter shape of the five enforcement loops in
+/// `candidates.rs::priority_actions_with_probe` — `AbilityKind::Activated`, the
+/// per-zone `activation_zone` filter, and `!is_mana_ability` — so the read-out's
+/// population is a subset of the population the enforcement gate decides. The
+/// two traversals are parallel by construction (see `activation_block_reasons`);
+/// only the loop structure is duplicated, never the authority.
+fn collect_activation_block_reasons_for_object(
+    state: &GameState,
+    player: PlayerId,
+    gates: &restrictions::ActivationRestrictionStaticGates,
+    obj_id: ObjectId,
+    required_activation_zone: Option<Zone>,
+    examined: &mut usize,
+    out: &mut HashMap<ObjectId, Vec<AbilityBlockEntry>>,
+) {
+    let mut entries: Vec<AbilityBlockEntry> = Vec::new();
+    for (ability_index, ability_def) in casting::activated_ability_definitions(state, obj_id) {
+        if ability_def.kind != AbilityKind::Activated {
+            continue;
+        }
+        if let Some(zone) = required_activation_zone {
+            if ability_def.activation_zone != Some(zone) {
+                continue;
+            }
+        }
+        // CR 605.1a: mana abilities are a different class decided by a different
+        // authority (`mana_abilities::can_activate_mana_ability_now`), which
+        // shares no code with the activation gate. Excluding them is what keeps
+        // the read-out's population a strict subset of the population
+        // `casting::activation_verdict` decides, so the two authorities are
+        // never asked the same question and cannot disagree. Byte-identical to
+        // the `!is_mana_ability` conjunct at all five enforcement sites.
+        if mana_abilities::is_mana_ability(&ability_def) {
+            continue;
+        }
+        *examined += 1;
+        if let Some(reason) =
+            casting::activation_cost_block_reason(state, player, obj_id, ability_index, gates)
+        {
+            entries.push(AbilityBlockEntry {
+                ability_index,
+                reason,
+            });
+        }
+    }
+    if !entries.is_empty() {
+        out.insert(obj_id, entries);
+    }
+}
+
+/// CR 118.3 + CR 602.5: per-object read-out of activated abilities the acting
+/// player is NOT being offered solely because they can't pay the cost right now.
+///
+/// TRANSPORT CALLERS MUST USE [`activation_block_reasons_for_viewer`].
+///
+/// CR 117.1: this function is UNSCOPED. It returns the acting player's read-out
+/// regardless of who is asking. It is `pub` only for the viewer-less
+/// `engine-wasm` entry point (`get_legal_actions_js`), a single-player local
+/// surface with exactly one recipient. Publishing this map from a
+/// multi-recipient transport leaks a controller-relative payability read-out to
+/// opponents — the disclosure defect this design exists to avoid.
+///
+/// Deliberately NOT part of `LegalActionsFull`. Learning the reason requires
+/// running the target-legality tail that `ActivationQuery::Legality`
+/// short-circuits past at the CR 118.3 exit, so this is strictly more work than
+/// enforcement needs. `server-core::session`, the three `phase-ai` policies and
+/// `legal_actions_bench` call `legal_actions_full` and must never pay for it —
+/// a separate entry point is how they don't. Same split as
+/// `flat_priority_actions` deliberately doing less than `legal_actions_full`.
+///
+/// CR 117.1b — "A player may activate an activated ability any time they have
+/// priority" — is why this is gated on `WaitingFor::Priority` rather than
+/// computed on every tick: an activated ability can ONLY be activated at
+/// priority, so an explanation of why you cannot activate one is only
+/// actionable in that window. The gate is the rule, not an optimisation.
+///
+/// Scoped to the acting player across the same five zones and behind the same
+/// player-scoping / `!is_mana_ability` filters as the enforcement sites in
+/// `candidates.rs`, so an entry can only ever describe an object the viewer
+/// controls. Battlefield and command-zone scans scope by `obj.controller`; the
+/// owner-keyed hand and graveyard scans scope by `obj.owner` (CR 108.4 +
+/// CR 108.4a — a card that is not a permanent or spell has no controller). The
+/// two files MUST agree: this read-out and the offered action set partition one
+/// ability space, so a scope that differs between them yields a blocked row for
+/// an ability that is never offered.
+///
+/// Bounded by [`MAX_ACTIVATION_BLOCK_TOTAL`]. Returns a map, never a `Result`.
+pub fn activation_block_reasons(state: &GameState) -> HashMap<ObjectId, Vec<AbilityBlockEntry>> {
+    // CR 117.1b: only actionable at priority.
+    let WaitingFor::Priority { player } = &state.waiting_for else {
+        return HashMap::new();
+    };
+    let player = *player;
+
+    // CR 613.1: the read-out must be produced from the SAME state binding the
+    // offered actions come from, or `activated_ability_definitions`'
+    // layer-sensitive ability indices disagree with the indices the offered
+    // `GameAction::ActivateAbility`s carry. Same layers-flush handling
+    // `legal_actions_full` uses, and the same counter, so the once-per-call
+    // whole-state clone is visible to a clone-budget measurement.
+    let flushed_owned;
+    let state: &GameState = if state.layers_dirty.is_dirty() {
+        crate::game::perf_counters::record_priority_cast_probe_state_clone();
+        flushed_owned = {
+            let mut flushed = state.clone();
+            layers::flush_layers(&mut flushed);
+            flushed
+        };
+        &flushed_owned
+    } else {
+        state
+    };
+
+    // Hoisted once, exactly as `candidates.rs::priority_actions_with_probe`
+    // hoists it for the five enforcement loops.
+    let gates = restrictions::ActivationRestrictionStaticGates::compute(state);
+    let mut blocked: HashMap<ObjectId, Vec<AbilityBlockEntry>> = HashMap::new();
+    let mut examined = 0usize;
+
+    // The same five zones, with the same filters, as the five enforcement sites
+    // in `candidates.rs::priority_actions_with_probe`. A comment there names
+    // this traversal; sharing one traversal between them would touch the AI
+    // search hot path and is deliberately out of scope.
+
+    // CR 602.2: "Only an object's controller (or its owner, if it doesn't have a
+    // controller) can activate its activated ability unless the object
+    // specifically says otherwise." Battlefield, therefore controller-scoped,
+    // with no `activation_zone` filter
+    // (the gate itself checks `obj.zone != required_zone`).
+    for &obj_id in &state.battlefield {
+        if let Some(obj) = state.objects.get(&obj_id) {
+            if obj.controller == player {
+                collect_activation_block_reasons_for_object(
+                    state,
+                    player,
+                    &gates,
+                    obj_id,
+                    None,
+                    &mut examined,
+                    &mut blocked,
+                );
+            }
+        }
+    }
+
+    // CR 408.3: the command zone holds specially designated cards only in the
+    // casual variants that define them (Commander, Planechase, ...), so this
+    // scan costs formats without one nothing.
+    if state.format_config.command_zone {
+        for &obj_id in &state.command_zone {
+            if let Some(obj) = state.objects.get(&obj_id) {
+                if obj.controller == player {
+                    collect_activation_block_reasons_for_object(
+                        state,
+                        player,
+                        &gates,
+                        obj_id,
+                        None,
+                        &mut examined,
+                        &mut blocked,
+                    );
+                }
+            }
+        }
+    }
+
+    // CR 602.1: hand-activated abilities (Cycling per CR 702.29a, etc.).
+    // CR 108.4 + CR 108.4a: a card in a hand is neither a permanent nor a spell,
+    // so it has no controller and the owner stands in. Mirrors the hand loop in
+    // `candidates.rs`.
+    for &obj_id in &state.players[player.0 as usize].hand {
+        if let Some(obj) = state.objects.get(&obj_id) {
+            if obj.owner == player {
+                collect_activation_block_reasons_for_object(
+                    state,
+                    player,
+                    &gates,
+                    obj_id,
+                    Some(Zone::Hand),
+                    &mut examined,
+                    &mut blocked,
+                );
+            }
+        }
+    }
+
+    // CR 113.6b + CR 602.2: graveyard-activated abilities.
+    // CR 108.4 + CR 108.4a: same owner fallback as the hand loop above, and
+    // CR 404.1 puts a card into its OWNER's graveyard. Mirrors the graveyard
+    // loop in `candidates.rs`.
+    for &obj_id in &state.players[player.0 as usize].graveyard {
+        if let Some(obj) = state.objects.get(&obj_id) {
+            if obj.owner == player {
+                collect_activation_block_reasons_for_object(
+                    state,
+                    player,
+                    &gates,
+                    obj_id,
+                    Some(Zone::Graveyard),
+                    &mut examined,
+                    &mut blocked,
+                );
+            }
+        }
+    }
+
+    // CR 702.170b: the plot special action on the top card of this player's own
+    // library. Player-scoped BY CONSTRUCTION (it is the top of that player's
+    // library), not by an `obj.controller` filter — the same shape the fifth
+    // enforcement site has.
+    if let Some((top_id, _src_id)) = casting::top_of_library_plot_source(state, player) {
+        collect_activation_block_reasons_for_object(
+            state,
+            player,
+            &gates,
+            top_id,
+            Some(Zone::Library),
+            &mut examined,
+            &mut blocked,
+        );
+    }
+
+    crate::game::perf_counters::record_activation_block_display_abilities_examined(examined);
+
+    truncate_activation_block_reasons(blocked)
+}
+
+/// CR 118.3: enforce [`MAX_ACTIVATION_BLOCK_TOTAL`] on the TOTAL entry count
+/// across every bucket, deterministically.
+///
+/// Truncation walks objects in `ObjectId` order and abilities in
+/// `ability_index` order, so the same board truncates identically for every
+/// recipient and across repeated calls. Returns a map and cannot fail.
+fn truncate_activation_block_reasons(
+    mut blocked: HashMap<ObjectId, Vec<AbilityBlockEntry>>,
+) -> HashMap<ObjectId, Vec<AbilityBlockEntry>> {
+    let total: usize = blocked.values().map(Vec::len).sum();
+    if total <= MAX_ACTIVATION_BLOCK_TOTAL {
+        return blocked;
+    }
+    let mut ids: Vec<ObjectId> = blocked.keys().copied().collect();
+    ids.sort_unstable();
+    let mut remaining = MAX_ACTIVATION_BLOCK_TOTAL;
+    let mut truncated: HashMap<ObjectId, Vec<AbilityBlockEntry>> = HashMap::new();
+    for id in ids {
+        if remaining == 0 {
+            break;
+        }
+        let Some(mut entries) = blocked.remove(&id) else {
+            continue;
+        };
+        entries.sort_unstable_by_key(|entry| entry.ability_index);
+        entries.truncate(remaining);
+        remaining -= entries.len();
+        if !entries.is_empty() {
+            truncated.insert(id, entries);
+        }
+    }
+    truncated
+}
+
+/// CR 117.1: viewer-scoped sibling of [`activation_block_reasons`], mirroring
+/// `legal_actions_for_viewer` — empty for any viewer without action authority.
+///
+/// This is the entry point every multi-recipient transport must call.
+pub fn activation_block_reasons_for_viewer(
+    state: &GameState,
+    viewer: PlayerId,
+) -> HashMap<ObjectId, Vec<AbilityBlockEntry>> {
+    if crate::game::turn_control::is_authorized_submitter(state, viewer) {
+        activation_block_reasons(state)
+    } else {
+        HashMap::new()
     }
 }
 
@@ -3753,6 +4137,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
 
         assert!(cheap_reject_candidate(
@@ -4036,7 +4422,7 @@ mod tests {
             Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
                 AbilityKind::Activated,
                 Effect::BecomeCopy {
-                    recipient: TargetFilter::SelfRef,
+                    recipient: crate::types::ability::CopyRecipient::Source,
                     target: TargetFilter::Any,
                     duration: Some(crate::types::ability::Duration::UntilEndOfTurn),
                     mana_value_limit: None,

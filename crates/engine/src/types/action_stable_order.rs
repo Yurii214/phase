@@ -279,6 +279,17 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
             };
             cmp_val(a0, b0)
         }
+        GameAction::SelectDieRolls {
+            ignore_indices: a0, ..
+        } => {
+            let GameAction::SelectDieRolls {
+                ignore_indices: b0, ..
+            } = b
+            else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0)
+        }
         GameAction::ChooseOutsideGameCards { selections: a0 } => {
             let GameAction::ChooseOutsideGameCards { selections: b0 } = b else {
                 unreachable!("cmp_payload: same-variant invariant");
@@ -654,6 +665,12 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
             };
             cmp_val(a0, b0)
         }
+        GameAction::ChooseResolutionOptionalPaymentBranch { choice: a0 } => {
+            let GameAction::ChooseResolutionOptionalPaymentBranch { choice: b0 } = b else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0)
+        }
         GameAction::RespondToSpliceOffer { card: a0 } => {
             let GameAction::RespondToSpliceOffer { card: b0 } = b else {
                 unreachable!("cmp_payload: same-variant invariant");
@@ -818,14 +835,16 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
         }
         GameAction::BeginResolveAll {
             max_resolutions: a0,
+            scope: a1,
         } => {
             let GameAction::BeginResolveAll {
                 max_resolutions: b0,
+                scope: b1,
             } = b
             else {
                 unreachable!("cmp_payload: same-variant invariant");
             };
-            cmp_val(a0, b0)
+            cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
         }
         GameAction::RespondResolveAllConsent {
             epoch: a0,
@@ -1705,6 +1724,7 @@ mod tests {
         DecisionGroupKey, DecisionKind, DecisionTemplate, IterationCount, ReplayMode,
     };
     use crate::game::combat::AttackTarget;
+    use crate::types::actions::ResolveAllScope;
     use crate::types::actions::{
         MayTriggerAutoChoiceOp, PrecastCopyShortcutResponse, ResolveAllConsentDecision,
     };
@@ -1723,8 +1743,14 @@ mod tests {
     #[test]
     fn newer_action_variants_compare_their_payloads() {
         assert_distinct_order(
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-            GameAction::BeginResolveAll { max_resolutions: 2 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
+            },
+            GameAction::BeginResolveAll {
+                max_resolutions: 2,
+                scope: ResolveAllScope::Own,
+            },
         );
         assert_distinct_order(
             GameAction::RespondResolveAllConsent {
@@ -1870,8 +1896,14 @@ mod tests {
             },
         );
         assert_distinct_order(
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-            GameAction::BeginResolveAll { max_resolutions: 2 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
+            },
+            GameAction::BeginResolveAll {
+                max_resolutions: 2,
+                scope: ResolveAllScope::Own,
+            },
         );
         assert_distinct_order(
             GameAction::RespondResolveAllConsent {

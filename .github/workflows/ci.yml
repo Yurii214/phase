@@ -17,6 +17,7 @@ on:
       - '.github/workflows/ci.yml'
       - '.github/workflows/deploy.yml'
       - '.github/workflows/release.yml'
+      - '.github/workflows/shell-release.yml'
   pull_request:
     branches: [main]
   merge_group:
@@ -107,6 +108,50 @@ jobs:
           fi
           ./scripts/check-engine-authorities.sh "$BASE"
 
+      - name: Release dispatch guard tests
+        # release.yml's recovery guard is release authorization: it decides
+        # whether a workflow_dispatch run may publish the tag it asks for. The
+        # tests read the guard's shell out of the committed workflow, so an edit
+        # that weakens it fails here instead of shipping unnoticed.
+        run: python3 scripts/release_dispatch_guard_tests.py
+
+      - name: Action pin checker unit tests
+        # Exercises the checker against throwaway repositories only; it does
+        # not walk this repository's own workflows. The gate over the real tree
+        # is action-pin-audit.yml, which runs the default branch's copy of this
+        # checker against the evaluated commit.
+        run: python3 scripts/check_action_pins_tests.py
+
+      - name: Action pin regression coverage
+        # Walks reusable-workflow and composite-action calls out of the
+        # release/deploy workflows: those run with deploy and signing secrets,
+        # so an action one call away from the edited file is the same exposure
+        # with less visibility. Pinning only top-level files would miss it.
+        #
+        # This runs from the pull request's checkout, so it is fast feedback and
+        # NOT the control: a commit can change a privileged workflow and this
+        # checker together. The authority is action-pin-audit.yml, which runs
+        # the default branch's copy of the checker against this commit.
+        run: python3 scripts/check_action_pins.py
+
+      - name: Media plugin packaging checker unit tests
+        # Exercises the checker against throwaway trees only; it does not read
+        # this repository's own packaging files. What matters is that it refuses
+        # a degraded read -- a renamed constant or a renamed build step -- rather
+        # than reporting a clean pass over the empty package set that a failed
+        # read produces.
+        run: python3 scripts/check_media_plugin_packaging_tests.py
+
+      - name: Media plugin packaging coverage
+        # media_stack.rs's REQUIRED_PLUGINS is the single authority for the
+        # GStreamer plugins this app needs, and both packaging consumers must
+        # cover every package it declares: the .deb's bundle.linux.deb.depends,
+        # and shell-release.yml's Linux apt step, which is the whole set
+        # linuxdeploy-plugin-gstreamer has available to copy into the AppImage.
+        # They are checked separately because #8615 shipped a silent AppImage
+        # while only the .deb side was current.
+        run: python3 scripts/check_media_plugin_packaging.py
+
       - name: Resolution-frame boundary guard
         # Full-tree guard: legacy resolution keys are reader/fixture-only, and
         # ResolutionStack mutation remains top-only or adjacent-pair scoped.
@@ -123,22 +168,17 @@ jobs:
           fi
           ./scripts/check-test-card-data-load.sh "$BASE"
 
-  rust-test:
-    name: Rust tests (shard ${{ matrix.shard }}/4)
+  rust-test-build:
+    name: Rust tests (build archive)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
 
       - name: Free runner disk for Rust test linking
-        # The nextest count partition splits execution, but each shard still
-        # runs `cargo test --no-run` for the whole workspace. Keep the Rust
-        # caches intact and reclaim only unused hosted-image payloads before
-        # setup-rust-toolchain restores/saves Cargo state.
+        # Build the workspace's test binaries once. Keep the Rust caches intact
+        # and reclaim only unused hosted-image payloads before setup-rust-toolchain
+        # restores/saves Cargo state.
         run: |
           echo "Disk before cleanup:"
           df -h /
@@ -174,13 +214,95 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Build test archive
+        # This is the only Rust test compilation. The archive includes all
+        # test binaries and their runtime dependencies for the shard jobs.
+        run: cargo nextest archive --profile ci --workspace --exclude phase-tauri --features engine/proptest --archive-file nextest-archive.tar.zst
+
+      - name: Build binaries launched by integration tests
+        # `CARGO_BIN_EXE_*` embeds target/debug paths. Nextest's archive does
+        # not preserve those launcher paths, so share the binaries the
+        # integration tests execute directly with every shard. This list and the
+        # two below must cover every such binary: a launcher added here must also
+        # be uploaded and made executable below, or the shard fails on the leg
+        # that was missed rather than on the one that was added.
+        # `crates/phase-ai/tests/gate_cli.rs` reds when they fall behind.
+        run: |
+          cargo build -p probe-pin
+          cargo build -p phase-ai --bin ai-commander --bin ai-duel --bin ai-gate
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload test runtime binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-runtime-binaries
+          path: |
+            target/debug/probe-pin
+            target/debug/ai-commander
+            target/debug/ai-duel
+            target/debug/ai-gate
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  rust-test:
+    name: Rust tests (shard ${{ matrix.shard }}/4)
+    needs: rust-test-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Some snapshot tests query Cargo metadata at runtime. This makes Cargo
+      # available but does not build test binaries; those come from the archive.
+      # Do not restore or save a Rust target cache: the archive is the cache.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache: false
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Download test archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+
+      - name: Prepare test archive destination
+        run: mkdir -p target
+
+      - name: Download test runtime binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-runtime-binaries
+          path: target/debug
+
+      - name: Restore test runtime binary permissions
+        # Actions artifacts preserve file contents but not executable bits.
+        run: chmod +x target/debug/probe-pin target/debug/ai-commander target/debug/ai-duel target/debug/ai-gate
+
       - name: Run tests
+        # The archive retains build options. Each shard only extracts it and
+        # executes its partition; it does not invoke Cargo or compile Rust.
         # PROPTEST_CASES split: PRs run a smaller case count for fast feedback;
         # pushes to main run the default (256) so any property regression is
         # caught before it lands on the branch that feeds staging/preview.
         env:
           PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '32' || '256' }}
-        run: cargo nextest run --profile ci --partition count:${{ matrix.shard }}/4 --workspace --exclude phase-tauri --features engine/proptest --status-level fail --final-status-level fail
+        run: cargo-nextest nextest run --profile ci --partition count:${{ matrix.shard }}/4 --archive-file nextest-archive.tar.zst --extract-to target --status-level fail --final-status-level fail
 
   card-data-gate:
     name: Card data (generate, validate, coverage)
@@ -747,7 +869,10 @@ jobs:
           test -x "$NODE_BIN"
           test -f "$TAURI_JS"
           export ORG_GRADLE_PROJECT_phaseNodeExecutable="$NODE_BIN"
-          "$NODE_BIN" "$TAURI_JS" android build --debug --target aarch64 --apk
+          (
+            cd client
+            "$NODE_BIN" "$TAURI_JS" android build --debug --target aarch64 --apk
+          )
 
       - name: Inspect ARM64 debug APK
         run: |
@@ -795,6 +920,7 @@ jobs:
     timeout-minutes: 5
     needs:
       - rust-lint
+      - rust-test-build
       - rust-test
       - card-data-gate
       - draft-pools
@@ -806,6 +932,7 @@ jobs:
       - name: Check split Rust jobs
         env:
           RUST_LINT_RESULT: ${{ needs.rust-lint.result }}
+          RUST_TEST_BUILD_RESULT: ${{ needs.rust-test-build.result }}
           RUST_TEST_RESULT: ${{ needs.rust-test.result }}
           CARD_DATA_RESULT: ${{ needs.card-data-gate.result }}
           DRAFT_POOLS_RESULT: ${{ needs.draft-pools.result }}
@@ -813,6 +940,10 @@ jobs:
           TAURI_RESULT: ${{ needs.tauri-check.result }}
           ANDROID_RESULT: ${{ needs.android-debug-apk.result }}
         run: |
+          if [ "$RUST_TEST_BUILD_RESULT" != "success" ]; then
+            echo "Rust test archive build failed: $RUST_TEST_BUILD_RESULT"
+            exit 1
+          fi
           results="$RUST_LINT_RESULT $RUST_TEST_RESULT $CARD_DATA_RESULT $DRAFT_POOLS_RESULT $WASM_RESULT $TAURI_RESULT $ANDROID_RESULT"
           # `skipped` is a pass: draft-pools is main-only and is skipped on PRs.
           for result in $results; do

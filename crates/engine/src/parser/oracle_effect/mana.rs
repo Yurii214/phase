@@ -25,7 +25,7 @@ use super::super::oracle_keyword::parse_granted_keyword_fragment;
 use super::super::oracle_quantity::{
     parse_cda_quantity, parse_cda_quantity_with_context, parse_event_context_quantity,
 };
-use super::super::oracle_target::parse_type_phrase;
+use super::super::oracle_target::parse_type_phrase_folding;
 use super::super::oracle_util::{parse_mana_production, parse_number, TextPair};
 use crate::parser::oracle_ir::context::ParseContext;
 use crate::types::ability::TargetFilter;
@@ -65,7 +65,7 @@ fn try_parse_any_color_among_permanents_filter(
     let prefix_len = trimmed_lower.len() - rest.len();
     let trimmed_original = after_color.trim().trim_end_matches('.').trim();
     let type_text = trimmed_original.get(prefix_len..)?.trim();
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -91,7 +91,7 @@ fn try_parse_for_each_color_mana(text: &str, lower: &str) -> Option<Effect> {
     // CR 702.167c + CR 105.1: "For each color among the exiled cards used to craft
     // this creature, add one mana of that color" (Sunbird Effigy) — the iteration
     // source is the craft-material linked-exile pool, not a battlefield type
-    // phrase. Tried first so the craft noun phrase wins over `parse_type_phrase`.
+    // phrase. Tried first so the craft noun phrase wins over `parse_type_phrase_folding`.
     if let Ok((craft_rest, filter)) =
         crate::parser::oracle_nom::quantity::parse_craft_materials_filter(type_text_lower.trim())
     {
@@ -105,11 +105,11 @@ fn try_parse_for_each_color_mana(text: &str, lower: &str) -> Option<Effect> {
             });
         }
     }
-    // Recover original-cased slice for parse_type_phrase.
+    // Recover original-cased slice for parse_type_phrase_folding.
     let offset = lower_trimmed.len() - rest.len();
     let original_trimmed = text.trim_end_matches('.').trim();
     let type_text = &original_trimmed[offset..offset + type_text_lower.len()];
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -323,7 +323,7 @@ pub(super) fn try_parse_add_mana_effect_with_context(
         let rest = rest.trim().trim_end_matches(['.', '"']).trim();
         let rest_lower = rest.to_lowercase();
 
-        // CR 603.7c + CR 106.3: "add one mana of any type that <source> produced"
+        // CR 608.2k + CR 106.3: "add one mana of any type that <source> produced"
         // (Vorinclex, Voice of Hunger: "land"; Roxanne, Starfall Savant: "Oasis or
         // artifact token"). The trailing `<source>` is an anaphor to the trigger
         // subject; only meaningful inside a TapsForMana trigger context, where the
@@ -335,7 +335,7 @@ pub(super) fn try_parse_add_mana_effect_with_context(
                     alt((
                         value((), tag("land")),
                         value((), tag("permanent")),
-                        // CR 603.7c + CR 106.3: Roxanne, Starfall Savant — the
+                        // CR 608.2k + CR 106.3: Roxanne, Starfall Savant — the
                         // anaphor names the tapped mana source, which is an Oasis
                         // OR an artifact token ("that Oasis or artifact token
                         // produced"). Same resolution: the added mana's type is
@@ -1399,7 +1399,7 @@ fn scan_mana_production_type(
                     nom_rest,
                 ),
                 |type_text: &str| {
-                    let (filter, remainder) = parse_type_phrase(type_text.trim());
+                    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
                     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
                         return None;
                     }
@@ -2694,7 +2694,7 @@ pub(crate) fn parse_mana_spend_trigger(lower: &str) -> Option<ManaSpellGrant> {
 /// CR 106.6 spend restriction was never the right type — see
 /// [`ManaSpellGrant::TriggerOnSpend`].
 ///
-/// The type/color phrase is DELEGATED to `oracle_target::parse_type_phrase`, the
+/// The type/color phrase is DELEGATED to `oracle_target::parse_type_phrase_folding`, the
 /// engine's single authority for phrases like "red instant or sorcery". One call
 /// therefore covers the whole type × color class ("an instant or sorcery spell",
 /// "a red instant or sorcery spell", "a Dragon creature spell") instead of the
@@ -2772,7 +2772,7 @@ fn parse_spend_trigger_filter(filter: &str) -> Option<TargetFilter> {
     if !post.is_empty() || pre.is_empty() {
         return None;
     }
-    let (parsed, remainder) = parse_type_phrase(pre);
+    let (parsed, remainder) = parse_type_phrase_folding(pre);
     if !remainder.trim().is_empty() || matches!(parsed, TargetFilter::Any) {
         return None;
     }
@@ -2941,7 +2941,7 @@ fn try_parse_amount_equal_to_with_context(
             value((), tag("equal to ")).parse(i)
         })?;
         let quantity_text = quantity_text.trim().trim_end_matches(['.', '"']);
-        // CR 601.2h + CR 603.7c: "the amount of mana spent to cast that spell"
+        // CR 601.2h: "the amount of mana spent to cast that spell"
         // resolves via `parse_event_context_quantity` to
         // triggering-spell spent-mana ref; fall back to `parse_cda_quantity` for
         // non-event quantities (e.g. "~'s power").
@@ -3141,7 +3141,7 @@ mod tests {
         );
     }
 
-    /// CR 603.7c + CR 106.3: Roxanne, Starfall Savant — the mana-echo anaphor
+    /// CR 608.2k + CR 106.3: Roxanne, Starfall Savant — the mana-echo anaphor
     /// names the tapped source, which is an Oasis OR an artifact token. The actual
     /// printed text is "add one mana of any type that Oasis or artifact token
     /// produced"; the bare "artifact token produced" and "Oasis produced" forms
@@ -3302,7 +3302,7 @@ mod tests {
         assert_eq!(typed.controller, Some(ControllerRef::Opponent));
     }
 
-    /// CR 106.1 + CR 601.2h + CR 603.7c: "add an amount of {C} equal to the
+    /// CR 106.1 + CR 601.2h: "add an amount of {C} equal to the
     /// amount of mana spent to cast that spell" — Mana Sculpt's sub_ability.
     /// The `{C}` colorless branch routes to `ManaProduction::Colorless`
     /// (since `parse_mana_production` only recognizes W/U/B/R/G and would

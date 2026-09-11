@@ -77,6 +77,7 @@ describe("normalizeEvents", () => {
       { type: "CardDrawn", data: { player_id: 0, object_id: 1, nth_in_turn: 1, nth_in_step: 1 } },
       { type: "PermanentTapped", data: { object_id: 1 } },
       { type: "PermanentUntapped", data: { object_id: 1 } },
+      { type: "Milled", data: { player_id: 0, object_id: 1, to: "Graveyard" } },
     ];
 
     expect(normalizeEvents(events)).toEqual([]);
@@ -199,6 +200,22 @@ describe("normalizeEvents", () => {
     ];
 
     const steps = normalizeEvents(events);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].effects[0].event.type).toBe("TurnStarted");
+  });
+
+  it("ExtraTurnCreated is non-visual while TurnStarted remains visual", () => {
+    const creation: GameEvent = {
+      type: "ExtraTurnCreated",
+      data: { player_id: 1, anchor: 0 },
+    };
+    const turnStarted: GameEvent = {
+      type: "TurnStarted",
+      data: { player_id: 1, turn_number: 2 },
+    };
+
+    expect(normalizeEvents([creation])).toEqual([]);
+    const steps = normalizeEvents([creation, turnStarted]);
     expect(steps).toHaveLength(1);
     expect(steps[0].effects[0].event.type).toBe("TurnStarted");
   });

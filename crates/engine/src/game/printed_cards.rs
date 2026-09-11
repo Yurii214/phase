@@ -1,3 +1,4 @@
+use crate::database::card_db::CardDbHandle;
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::database::CardDatabase;
 use crate::types::ability::{
@@ -33,6 +34,18 @@ use super::morph::apply_face_down_creature_characteristics;
 use super::public_state::{
     bump_state_revision, finalize_public_state, mark_public_state_all_dirty,
 };
+
+/// Controls whether card-database rehydration may publish a state immediately.
+///
+/// Persisted-game restore must defer publication until the restore owner has
+/// installed every runtime-only field and the engine has completed its single
+/// restore finalization boundary. Ordinary in-memory callers retain the
+/// immediate behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardDbRehydrationFinalization {
+    Immediate,
+    Defer,
+}
 
 /// CR 205.3m: Look up printed core types for a card name from deck-pool faces or
 /// the card-face registry when a runtime `GameObject` lacks characteristic data.
@@ -356,6 +369,24 @@ pub fn apply_back_face_to_object(obj: &mut GameObject, back_face: BackFaceData) 
     // directions matter and both are this one line: a back face the parser could
     // not fully read starts gating here, and transforming back off it stops.
     obj.parse_warnings = back_face.parse_warnings;
+}
+
+/// CR 400.7 + CR 712.8a (#7565): swap the object's live face with its stored
+/// back face, preserving the stored slot's `layout_kind`. The layout is a
+/// printed property of the CARD PAIR, not of whichever half happens to be
+/// stashed — `snapshot_object_face` hardcodes `None`, so every bare
+/// snapshot/apply/store dance silently erased the marker after one back-face
+/// round trip, muting the split/MDFC cast-face prompt and every other
+/// `layout_kind` consumer. Single authority for all symmetric face swaps.
+pub fn swap_object_faces(obj: &mut GameObject) {
+    let Some(stored) = obj.back_face.take() else {
+        return;
+    };
+    let layout_kind = stored.layout_kind;
+    let mut snapshot = snapshot_object_face(obj);
+    snapshot.layout_kind = layout_kind;
+    apply_back_face_to_object(obj, stored);
+    obj.back_face = Some(snapshot);
 }
 
 /// CR 306.5b + CR 310.4b + CR 614.1c: Seed the intrinsic "enters with N
@@ -711,7 +742,22 @@ pub fn apply_copiable_values(
             )
         })
         .collect();
-    obj.replacement_definitions = Arc::clone(&values.replacement_definitions).into();
+    // CR 613.1a + CR 707.2 + CR 611.2c: a copy effect applies COPIABLE VALUES —
+    // "the values derived from the text printed on the object" (CR 707.2), which
+    // closes "Other effects ..., status, counters, and stickers are not copied."
+    // A replacement created by the resolution of a spell or ability is not a
+    // characteristic at all (CR 611.2c), so a Clone / Vesuvan / Mirrorweave /
+    // Copy-Enchantment recipient must keep the shields it already carries. Without
+    // this, the Layer-1a assignment here would destroy them MID-PASS, before the
+    // tail settle and before the CR 613.2b Layer-1b reseed (which rebuilds the
+    // carried set by reading `live` and so cannot recover them).
+    // `copiable_replacement_definitions` already encodes the producer half of this
+    // invariant; this is its recipient half.
+    obj.replacement_definitions =
+        crate::game::game_object::reseed_replacements_carrying_resolution_effects(
+            &obj.replacement_definitions,
+            &values.replacement_definitions,
+        );
     obj.static_definitions = Arc::clone(&values.static_definitions).into();
     // CR 709.5b + CR 707.2: carry the copied Room half data. Layer-derived —
     // the Step-1 seed clears it, so it expires with this copy effect.
@@ -812,7 +858,36 @@ pub fn snapshot_object_face(obj: &GameObject) -> BackFaceData {
             .iter_all()
             .map(|entry| entry.definition.clone())
             .collect(),
-        replacement_definitions: obj.replacement_definitions.clone(),
+        // CR 611.2c + CR 613.1 (issue #8485): a face snapshot captures the FACE's
+        // characteristics. A replacement created by the resolution of a spell or
+        // ability is not one of them, so it must not ride out with the face.
+        //
+        // This filter is load-bearing for correctness, not tidiness.
+        // `apply_back_face_to_object` writes this vector to BOTH the live store and
+        // `base_replacement_definitions`. A `Resolution`-origin def reaching base
+        // breaks the precondition that
+        // `game_object::reseed_replacements_carrying_resolution_effects` relies on
+        // ("no baseline ever contains a `Resolution` member"): the carry-over would
+        // then compute `base ++ live_resolution` on EVERY layer pass, growing the
+        // shield count by one per pass without bound — a Maze of Ith / regeneration /
+        // Fog shield would prevent N damage events instead of one. Reachable on any
+        // transform round-trip, which stashes the live face and restores it.
+        //
+        // Same guard `copiable_replacement_definitions` (producer side) and
+        // `GameObject::sync_missing_base_characteristics` (back-fill side) already
+        // apply. Filtering HERE rather than at the base write also stops the live
+        // write from restoring a stale, possibly already-consumed shield.
+        //
+        // Consequence, deliberate and documented: a transform DROPS a carried
+        // resolution shield rather than duplicating it. See the removal-paths note
+        // on `reseed_replacements_carrying_resolution_effects`.
+        replacement_definitions: obj
+            .replacement_definitions
+            .iter_all()
+            .filter(|d| !d.is_resolution_installed())
+            .cloned()
+            .collect::<Vec<_>>()
+            .into(),
         // Snapshot: deref the Arc to satisfy `Definitions::from(Vec<T>)`.
         static_definitions: (*obj.base_static_definitions).clone().into(),
         color: obj.color.clone(),
@@ -826,6 +901,7 @@ pub fn snapshot_object_face(obj: &GameObject) -> BackFaceData {
         // restores them rather than inheriting whatever the other face had.
         parse_warnings: obj.parse_warnings.clone(),
         layout_kind: None,
+        is_swap_snapshot: true,
     }
 }
 
@@ -875,6 +951,7 @@ pub fn snapshot_object_base_face(obj: &GameObject) -> BackFaceData {
         // face's diagnostics and the layer system never touches it.
         parse_warnings: obj.parse_warnings.clone(),
         layout_kind: None,
+        is_swap_snapshot: true,
     }
 }
 
@@ -1129,6 +1206,7 @@ fn back_face_for_card_face_with_printed_ref(
         // Empty seed; `apply_card_face_to_back_face` below fills it from the face.
         parse_warnings: Vec::new(),
         layout_kind: None,
+        is_swap_snapshot: false,
     };
     apply_card_face_to_back_face(&mut back, face);
     if layout_kind != LayoutKind::Single {
@@ -1150,15 +1228,96 @@ pub fn populate_back_face_if_dfc(obj: &mut GameObject, db: &CardDatabase, card_f
     }
 }
 
+/// CR 702.146a + CR 712.8c: Restore the swap-snapshot provenance bit on state
+/// serialized before that bit existed.
+///
+/// The pre-change contract was implicit: [`snapshot_object_face`] erased
+/// `layout_kind`, and readers took that erasure to mean "this stored face is the
+/// object's stashed other half". `BackFaceData::is_swap_snapshot` replaced it
+/// with an explicit marker, which `serde(default)` reads as `false` for every
+/// earlier save — so a permanent that was already face-swapped when the game was
+/// stored loads with its provenance gone. Disturb pays for that directly: the
+/// keyword sits on the card's FRONT face and the card is cast transformed
+/// (CR 702.146a), so [`crate::game::keywords::effective_disturb_cost`] can only
+/// reach it through the stashed face, and only through this marker.
+///
+/// The legacy signature is the erased layout AND the object's own record that it
+/// is currently showing its alternative face. Those flags are set by the same
+/// authorities that take the snapshot — face-down (CR 708.2a), flip
+/// (CR 710.1b), transform (CR 712), specialize — so this asks the instance that
+/// already knows instead of inferring a swap from the stored face's shape.
+/// Requiring both halves is what keeps a still-unswapped printed back face out:
+/// such a face carries none of those flags, so an absent layout alone can never
+/// promote it to a snapshot.
+///
+/// Must run BEFORE [`reapply_printed_faces_from_card_db`], which repairs the
+/// erased `layout_kind` and would otherwise consume the signature this reads.
+/// The bit is read at query time and is not part of the public view, so a
+/// restoration needs no revision bump of its own.
+fn restore_legacy_swap_snapshot_provenance(state: &mut GameState) {
+    let object_ids: Vec<_> = state.objects.keys().copied().collect();
+    for object_id in object_ids {
+        let Some(obj) = state.objects.get_mut(&object_id) else {
+            continue;
+        };
+        let shows_alternative_face =
+            obj.face_down || obj.flipped || obj.transformed || obj.specialized_color.is_some();
+        if !shows_alternative_face {
+            continue;
+        }
+        let Some(back_face) = obj.back_face.as_mut() else {
+            continue;
+        };
+        if back_face.is_swap_snapshot || back_face.layout_kind.is_some() {
+            continue;
+        }
+        back_face.is_swap_snapshot = true;
+    }
+}
+
 pub fn rehydrate_game_from_card_db(state: &mut GameState, db: &CardDatabase) {
+    rehydrate_game_from_card_db_with_finalization(
+        state,
+        db,
+        CardDbRehydrationFinalization::Immediate,
+    );
+}
+
+/// Install the shared card-database handle on `state`.
+///
+/// The single authority for `GameState::card_db`. Every path that builds or
+/// restores a game must call this: the Momir Basic emblem's random creature
+/// draw (CR 707.2 + CR 202.3) queries the whole card corpus at resolution
+/// time through this handle, and without it the emblem can create nothing.
+///
+/// Deliberately separate from [`rehydrate_game_from_card_db`], which takes a
+/// borrowed `&CardDatabase` and therefore has no `Arc` to share. Callers that
+/// own the database as an `Arc` (the WASM engine's `CARD_DB`, the server's
+/// session store) call both.
+pub fn install_card_db(state: &mut GameState, db: std::sync::Arc<CardDatabase>) {
+    state.card_db = Some(CardDbHandle::new(db));
+}
+
+/// Rehydrate printed-card state while explicitly choosing whether this call is
+/// its public-state boundary. Restore owners use [`CardDbRehydrationFinalization::Defer`]
+/// so the prepared restore token can perform the sole finalization after all
+/// runtime fields are present.
+pub fn rehydrate_game_from_card_db_with_finalization(
+    state: &mut GameState,
+    db: &CardDatabase,
+    finalization: CardDbRehydrationFinalization,
+) {
     rehydrate_card_db_metadata(state, db);
+    restore_legacy_swap_snapshot_provenance(state);
     let (changed_any, changed_battlefield) = reapply_printed_faces_from_card_db(state, db);
     repair_battlefield_trigger_index_after_face_reapply(state, changed_battlefield);
 
     if changed_any || state.layers_dirty.is_dirty() {
         bump_state_revision(state);
         mark_public_state_all_dirty(state);
-        finalize_public_state(state);
+        if matches!(finalization, CardDbRehydrationFinalization::Immediate) {
+            finalize_public_state(state);
+        }
     }
 }
 
@@ -1200,54 +1359,18 @@ fn rehydrate_card_db_metadata(state: &mut GameState, db: &CardDatabase) {
         state.all_card_names = db.card_names().into();
     }
 
-    // CR 707.2 + CR 202.3: Build the Momir Basic random-token pool. Gated on the
-    // format AND emptiness: `rehydrate_card_db_metadata` also runs on the
-    // mid-game debug-spawn path (engine-wasm), so without the emptiness guard we
-    // would rescan the full creature corpus on every spawn.
-    //
-    // The emptiness check must watch `momir_pool_faces`, NOT just `momir_pool`:
-    // `momir_pool` is serialized but `momir_pool_faces` is `#[serde(skip)]`
-    // (it holds full `CardFace` values, too heavy to ship). After ANY
-    // deserialize — `restore_game_state` on worker restart/PWA update, or a peer
-    // syncing — `momir_pool` comes back populated while `momir_pool_faces` is
-    // empty. Gating on `momir_pool.is_empty()` alone would then refuse to rebuild
-    // the faces map, leaving `CreateTokenCopyFromPool` with zero hydratable
-    // candidates (every name in the pool misses the empty faces map) and the
-    // emblem silently makes no token. Rebuilding when EITHER is empty restores
-    // the faces map; the rebuild overwrites `momir_pool` wholesale, so a
-    // non-empty pool is regenerated identically (keys are sorted → deterministic
-    // across peers), never duplicated.
-    if state.format_config.format == crate::types::format::GameFormat::Momir
-        && (state.momir_pool.is_empty() || state.momir_pool_faces.is_empty())
+    // CR 400.11 + CR 400.11b: stock the sealed-booster shelf for a game that can
+    // open a pack. Gated on the card scan AND emptiness for the same two reasons
+    // the Momir pool is: the scan walks the whole game's ability trees and the
+    // stocking walks the whole printed corpus, and `rehydrate_card_db_metadata`
+    // also runs on the mid-game debug-spawn path. `booster_shelf` is
+    // `#[serde(skip)]`, so this is also the rebuild after any deserialize; it is
+    // seeded from the persisted `rng_seed` rather than drawn from `state.rng`,
+    // so a restored or peer-rebuilt state shelves the same products instead of
+    // advancing the game stream a restore-count-dependent number of steps.
+    if state.booster_shelf.is_empty() && crate::game::boosters::game_opens_booster_packs(state, db)
     {
-        let mut pool: std::collections::BTreeMap<i32, Vec<String>> =
-            std::collections::BTreeMap::new();
-        let mut faces: HashMap<String, CardFace> = HashMap::new();
-        for face in db
-            .face_index
-            .values()
-            .filter(|face| face.card_type.core_types.contains(&CoreType::Creature))
-            // CR 202.1b + CR 202.3b + CR 712.8a: `face_index` holds BOTH faces of
-            // every multi-face card, so a transform/flip/meld BACK face (which has
-            // no printed mana cost → `ManaCost::NoCost`, mana value 0) would key
-            // into the pool at MV 0. A back face is not a separately castable
-            // creature *card* (outside the battlefield a DFC has only its front
-            // face's characteristics), so it is never a valid Momir pick. Exclude
-            // costless faces by their data signal: only an ABSENT manaCost maps to
-            // `NoCost`, so modal-DFC creature backs (explicit cost → `Cost{..}`)
-            // and genuine `{0}` creatures (`Cost{generic:0}`) are preserved.
-            .filter(|face| !matches!(face.mana_cost, ManaCost::NoCost))
-        {
-            let mv = face.mana_cost.mana_value() as i32;
-            pool.entry(mv).or_default().push(face.name.clone());
-            faces.insert(face.name.to_lowercase(), face.clone());
-        }
-        // Deterministic selection order regardless of DB iteration order.
-        for names in pool.values_mut() {
-            names.sort();
-        }
-        state.momir_pool = pool;
-        state.momir_pool_faces = std::sync::Arc::new(faces);
+        state.booster_shelf = Arc::new(crate::game::boosters::build_shelf(db, state.rng_seed));
     }
 }
 
@@ -1604,6 +1727,110 @@ pub fn derive_colors_from_mana_cost(mana_cost: &ManaCost) -> Vec<ManaColor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CR 611.2c + CR 613.1 (issue #8485, round-5 HIGH-1): a transform ROUND TRIP
+    /// must not seed `base_replacement_definitions` with a resolution-created
+    /// shield, and must not multiply it once per layer pass.
+    ///
+    /// The bug this pins: `snapshot_object_face` copied the LIVE store verbatim and
+    /// `apply_back_face_to_object` writes that snapshot to live AND base. A
+    /// `Resolution`-origin def in base falsifies the precondition
+    /// `game_object::reseed_replacements_carrying_resolution_effects` depends on, so
+    /// the carry-over computed `base ++ live_resolution` on EVERY pass and the shield
+    /// count grew without bound — a Maze of Ith / regeneration / Fog shield would
+    /// prevent N damage events instead of one. No existing test covered a transform
+    /// round-trip over a live resolution shield, which is how it survived review.
+    ///
+    /// Revert-failing on two independent assertions: un-filter
+    /// `snapshot_object_face` and (a) base holds a `Resolution` def and (b) the
+    /// per-object resolution count GROWS between the two `evaluate_layers` passes.
+    #[test]
+    fn transform_round_trip_does_not_duplicate_a_resolution_shield() {
+        fn printed_def() -> ReplacementDefinition {
+            ReplacementDefinition::new(ReplacementEvent::DamageDone)
+                .prevention_shield(crate::types::ability::PreventionAmount::All)
+        }
+        fn resolution_shield() -> ReplacementDefinition {
+            ReplacementDefinition::new(ReplacementEvent::DamageDone)
+                .prevention_shield(crate::types::ability::PreventionAmount::All)
+                .expiry(crate::types::ability::RestrictionExpiry::EndOfTurn)
+        }
+        fn resolution_count(state: &GameState, id: ObjectId) -> usize {
+            state.objects[&id]
+                .replacement_definitions
+                .iter_all()
+                .filter(|d| d.is_resolution_installed())
+                .count()
+        }
+
+        let mut state = GameState::new_two_player(42);
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Front Face".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+            obj.base_characteristics_initialized = true;
+            obj.base_replacement_definitions = Arc::new(vec![printed_def()]);
+            obj.replacement_definitions = vec![printed_def()].into();
+            obj.install_resolution_replacement(resolution_shield());
+            let mut back = snapshot_object_face(obj);
+            back.name = "Back Face".to_string();
+            obj.back_face = Some(back);
+        }
+        // Positive reach-guard: the shield really is live before the transform, so
+        // the post-transform assertions are not vacuously satisfied by there being
+        // nothing to duplicate.
+        assert_eq!(resolution_count(&state, id), 1);
+
+        swap_object_faces(state.objects.get_mut(&id).unwrap());
+        assert_eq!(
+            state.objects[&id].name, "Back Face",
+            "reach-guard: the transform must actually have happened"
+        );
+        swap_object_faces(state.objects.get_mut(&id).unwrap());
+        assert_eq!(
+            state.objects[&id].name, "Front Face",
+            "reach-guard: the return transform must actually have happened"
+        );
+
+        // The invariant the whole carry-over rests on.
+        assert!(
+            !state.objects[&id]
+                .base_replacement_definitions
+                .iter()
+                .any(|d| d.is_resolution_installed()),
+            "a transform round-trip must not seed base with a `Resolution` def: \
+             base = {:?}",
+            state.objects[&id].base_replacement_definitions
+        );
+
+        state.layers_dirty.mark_full();
+        crate::game::layers::evaluate_layers(&mut state);
+        let after_first = resolution_count(&state, id);
+        state.layers_dirty.mark_full();
+        crate::game::layers::evaluate_layers(&mut state);
+        let after_second = resolution_count(&state, id);
+        assert_eq!(
+            after_first, after_second,
+            "the resolution-shield count must not grow per layer pass \
+             (pass 1: {after_first}, pass 2: {after_second})"
+        );
+        assert!(
+            after_second <= 1,
+            "at most one copy of the shield may survive, got {after_second}"
+        );
+    }
+
     use crate::database::CardDatabase;
     use crate::game::deck_loading::create_object_from_card_face;
     use crate::game::deck_loading::DeckEntry;
@@ -1969,6 +2196,7 @@ mod tests {
         object.color = vec![ManaColor::White];
         object.base_color = vec![ManaColor::White];
         object.back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: normal_half.name.clone(),
             power: None,
             toughness: None,
@@ -2180,18 +2408,16 @@ mod tests {
         );
     }
 
-    /// CR 707.2 + CR 202.3: The Momir random-token pool's hydration map
-    /// (`momir_pool_faces`) is `#[serde(skip)]`, while `momir_pool` is
-    /// serialized. After a deserialize-then-rehydrate cycle (`restore_game_state`
-    /// on worker restart / PWA update, or a peer sync), `momir_pool` is populated
-    /// but `momir_pool_faces` is empty. Rehydration MUST rebuild the faces map in
-    /// that state — otherwise `CreateTokenCopyFromPool` finds zero hydratable
-    /// candidates and the Momir emblem silently makes no creature token. This is
-    /// the discriminating guard: it fails if the rebuild is gated on
-    /// `momir_pool.is_empty()` alone (the pre-fix behavior).
+    /// CR 707.2 + CR 202.3: The Momir Basic emblem draws its random creature
+    /// from the WHOLE card corpus at resolution time, through
+    /// `GameState::card_db`. That handle is `#[serde(skip)]`, so a restored or
+    /// peer-synced state comes back with `card_db: None` and the emblem can
+    /// create nothing until `install_card_db` runs again. This guards the
+    /// install itself, and that the handle is a cheap shared pointer rather
+    /// than a copy of the database (`GameState::clone()` runs per candidate
+    /// during AI search).
     #[test]
-    fn momir_pool_faces_rebuilt_after_restore_drops_serde_skip_map() {
-        // A mana-value-4 creature ({3}{G} = MV 4) is the only card in the pool.
+    fn install_card_db_shares_one_database_across_state_clones() {
         let creature = test_face(
             "Test Pool Beast",
             "test-pool-beast-oracle-id",
@@ -2205,34 +2431,43 @@ mod tests {
             "test pool beast": serde_json::to_value(&creature).unwrap(),
         })
         .to_string();
-        let db = CardDatabase::from_json_str(&export).expect("export db should parse");
+        let db = std::sync::Arc::new(
+            CardDatabase::from_json_str(&export).expect("export db should parse"),
+        );
 
         let mut state = GameState::new_two_player(42);
         state.format_config = crate::types::format::FormatConfig::momir();
-
-        // First hydration builds both the pool and the faces map.
-        rehydrate_game_from_card_db(&mut state, &db);
-        assert_eq!(
-            state.momir_pool.get(&4).map(Vec::as_slice),
-            Some(["Test Pool Beast".to_string()].as_slice()),
-            "MV-4 creature must land in the pool keyed by mana value"
-        );
         assert!(
-            state.momir_pool_faces.contains_key("test pool beast"),
-            "faces map must hydrate the MV-4 creature on first build"
+            state.card_db.is_none(),
+            "a fresh state carries no database handle until one is installed"
         );
 
-        // Simulate the serde round-trip: `momir_pool` survives, the
-        // `#[serde(skip)]` faces map comes back empty.
-        state.momir_pool_faces = std::sync::Arc::new(HashMap::new());
-        assert!(!state.momir_pool.is_empty(), "pool persists across serde");
-
-        // Rehydrating a restored game must repopulate the faces map even though
-        // `momir_pool` is non-empty.
-        rehydrate_game_from_card_db(&mut state, &db);
+        install_card_db(&mut state, std::sync::Arc::clone(&db));
         assert!(
-            state.momir_pool_faces.contains_key("test pool beast"),
-            "faces map must be rebuilt after a restore that dropped the skip map"
+            state
+                .card_db
+                .as_ref()
+                .and_then(|handle| handle.get_face_by_name("Test Pool Beast"))
+                .is_some(),
+            "the installed handle must resolve faces from the database it was given"
+        );
+
+        // The clone must share the same allocation, not deep-copy the corpus.
+        let cloned = state.clone();
+        let handle = cloned.card_db.as_ref().expect("clone keeps the handle");
+        assert!(
+            std::sync::Arc::ptr_eq(handle.arc(), &db),
+            "GameState::clone() must share the database, never copy it"
+        );
+
+        // A serde round-trip drops the handle (`#[serde(skip)]`), which is why
+        // every restore path has to reinstall it.
+        state.card_db = None;
+        assert!(state.card_db.is_none());
+        install_card_db(&mut state, db);
+        assert!(
+            state.card_db.is_some(),
+            "reinstall restores the draw source"
         );
     }
 
@@ -3693,6 +3928,123 @@ mod tests {
         assert!(
             !obj.card_types.core_types.contains(&CoreType::Creature),
             "bestowed object must not keep Creature core type"
+        );
+    }
+
+    /// A graveyard object whose live face is the BACK half and whose stashed
+    /// FRONT half carries Disturb (CR 702.146a) — the shape a card cast
+    /// transformed for its Disturb cost leaves behind.
+    fn swapped_disturb_object() -> GameObject {
+        let disturb_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 1,
+        };
+
+        let mut front = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Disturb Front Face".to_string(),
+            Zone::Graveyard,
+        );
+        front.keywords = vec![Keyword::Disturb(disturb_cost)];
+
+        let mut obj = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Disturb Back Face".to_string(),
+            Zone::Graveyard,
+        );
+        obj.transformed = true;
+        obj.back_face = Some(snapshot_object_face(&front));
+        obj
+    }
+
+    /// Strip the provenance marker from a serialized state the way a writer
+    /// that predates the field left it out entirely. The count assertion is the
+    /// abort guard: a silent no-op replace would measure nothing.
+    fn as_legacy_shape(state: &GameState) -> String {
+        const MARKER: &str = "\"is_swap_snapshot\":true";
+        let json = serde_json::to_string(state).expect("state serializes");
+        assert_eq!(
+            json.matches(MARKER).count(),
+            1,
+            "probe must find exactly one marker to strip"
+        );
+        let legacy = json
+            .replace(&format!(",{MARKER}"), "")
+            .replace(&format!("{MARKER},"), "");
+        assert!(
+            !legacy.contains(MARKER),
+            "the legacy shape must carry no marker at all"
+        );
+        legacy
+    }
+
+    /// #7568: a state written before `is_swap_snapshot` existed carries no such
+    /// field, so `serde(default)` reads it as `false` and
+    /// `keywords::effective_disturb_cost` loses the stashed front face it reads
+    /// the keyword through (CR 702.146a). Deserialize exactly that shape and
+    /// prove the cost survives the load.
+    #[test]
+    fn a_legacy_swapped_face_keeps_its_disturb_cost_across_a_load() {
+        let mut state = GameState::new_two_player(42);
+        state.objects.insert(ObjectId(1), swapped_disturb_object());
+
+        assert!(
+            crate::game::keywords::effective_disturb_cost(&state, ObjectId(1)).is_some(),
+            "the current shape must reach Disturb through the swap snapshot"
+        );
+
+        let mut loaded: GameState =
+            serde_json::from_str(&as_legacy_shape(&state)).expect("legacy shape deserializes");
+
+        // The defect itself — and what makes the assertion after the repair
+        // discriminate rather than merely pass.
+        assert!(
+            crate::game::keywords::effective_disturb_cost(&loaded, ObjectId(1)).is_none(),
+            "an unrepaired legacy load loses the Disturb lookup"
+        );
+
+        // Through the public load entry point, not the repair directly, so the
+        // wiring is covered too: an empty database leaves the printed-face pass
+        // with nothing to re-apply, which is exactly what isolates the repair.
+        rehydrate_game_from_card_db(&mut loaded, &CardDatabase::default());
+
+        assert!(
+            crate::game::keywords::effective_disturb_cost(&loaded, ObjectId(1)).is_some(),
+            "the repaired legacy load must offer the Disturb cost again"
+        );
+    }
+
+    /// The guard on the other side: a still-unswapped printed back face carries
+    /// none of the face-state flags, so an absent `layout_kind` must never
+    /// promote it to a snapshot — otherwise every printed DFC back face would
+    /// start granting its front face's Disturb.
+    #[test]
+    fn a_still_unswapped_printed_back_face_is_never_promoted_to_a_snapshot() {
+        let mut state = GameState::new_two_player(42);
+        let mut obj = swapped_disturb_object();
+        // Same stored face, but the object does NOT report showing its
+        // alternative half — this is a printed back face, not a stash.
+        obj.transformed = false;
+        obj.back_face.as_mut().unwrap().is_swap_snapshot = false;
+        state.objects.insert(ObjectId(1), obj);
+
+        restore_legacy_swap_snapshot_provenance(&mut state);
+
+        assert!(
+            !state.objects[&ObjectId(1)]
+                .back_face
+                .as_ref()
+                .unwrap()
+                .is_swap_snapshot,
+            "a printed back face must not be promoted to a swap snapshot"
+        );
+        assert!(
+            crate::game::keywords::effective_disturb_cost(&state, ObjectId(1)).is_none(),
+            "a printed back face must not grant Disturb"
         );
     }
 }

@@ -15,10 +15,11 @@ import type { DraftKind, DraftPlayerView, PairingView, PodPolicy, PoolInput, Sea
 import type { MatchScore } from "./types";
 import { P2PDraftHost, type DraftHostEvent } from "./p2p-draft-host";
 import { hostRoom, type HostResult } from "../network/connection";
-import type { DraftMatchLaunch, DraftMatchSettlement, DraftPauseReason } from "../network/draftProtocol";
+import type { CommanderSeatDecks, DraftCommanderLaunch, DraftMatchDeckPayload, DraftMatchLaunch, DraftMatchSettlement, DraftPauseReason } from "../network/draftProtocol";
 import type { BrokerClient, RegisterHostRequest } from "../services/brokerClient";
 import { loadDraftHostSession } from "../services/draftPersistence";
 import type { DraftIntergameCommand, DraftIntergameCommandAck } from "../services/intergameCommandLedger";
+import type { DraftWorkspaceState } from "../components/draft/workspace/types";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -37,11 +38,13 @@ export type DraftPodHostStatus =
 export type DraftPodHostEvent =
   | { type: "statusChanged"; status: DraftPodHostStatus }
   | { type: "roomCreated"; roomCode: string }
+  | { type: "workspaceRestored"; workspaceState: DraftWorkspaceState | null }
   | { type: "viewUpdated"; view: DraftPlayerView }
   | { type: "lobbyUpdate"; seats: SeatPublicView[]; joined: number; total: number }
   | { type: "lobbyFull" }
   | { type: "draftStarted"; view: DraftPlayerView }
-  | { type: "pickReceived"; seatIndex: number; cardInstanceId: string }
+  /** `cardInstanceIds` = the cards this seat drafted in this step, on both the normal and the draft-effect path. */
+  | { type: "pickReceived"; seatIndex: number; cardInstanceIds: string[] }
   | { type: "roundComplete" }
   | { type: "draftComplete" }
   | { type: "deckSubmitted"; seatIndex: number }
@@ -54,6 +57,13 @@ export type DraftPodHostEvent =
   | { type: "seatKicked"; seatIndex: number; reason: DraftPauseReason | string }
   | { type: "pairingsGenerated"; round: number; pairings: PairingView[] }
   | { type: "matchStart"; launch: DraftMatchLaunch }
+  /**
+   * CR 903.13a: the completed Commander pod's launch into ONE shared N-seat
+   * game. `handleHostEvent` in the store is typed on THIS union, not on
+   * `DraftHostEvent`, so the member has to exist here for the host's own launch
+   * to reach the store at all.
+   */
+  | { type: "commanderLaunch"; launch: DraftCommanderLaunch }
   | { type: "matchResultReceived"; matchId: string; winnerSeat: number | null }
   | { type: "roundAdvanced" }
   | { type: "timerExpired" }
@@ -120,6 +130,8 @@ export interface DraftPodHostConfig {
   persistenceId?: string;
   /** Resume from a specific room code (re-hosts on the same PeerJS ID). */
   preferredRoomCode?: string;
+  /** HTTP origin of the selected phase-server for best-effort P2P backups. */
+  backupEndpoint?: string;
   /** Abort signal for cancellation during setup. */
   signal?: AbortSignal;
 }
@@ -245,11 +257,22 @@ export class DraftPodHostAdapter {
         abortIfRequested();
       }
 
-      // 3. For cube drafts, the WASM CARD_DB must be populated before
-      //    create_multiplayer_draft is invoked (it resolves cube cards
-      //    against the database). The set branch reads its pool from JSON
-      //    and never touches CARD_DB.
-      if (config.poolInput.type === "Cube") {
+      // 3. Two pod shapes need the WASM CARD_DB, for different reasons.
+      //    A CUBE pod needs it before create_multiplayer_draft is invoked,
+      //    which resolves cube cards against the database. A COMMANDERDRAFT
+      //    pod needs it before get_bot_deck, which designates each bot seat's
+      //    commander (CR 903.3) and constrains that seat's deck to the
+      //    designation's colour identity (CR 903.5c) — both read off a
+      //    `CardFace`, so with no database draft-wasm refuses rather than
+      //    shipping an unjudged deck. A Set pool for any of the four
+      //    CR 905.1a kinds still reads its pool from JSON and needs no
+      //    database. A Chaos pool is set-backed too: draft-wasm resolves its
+      //    private assignments from supplied pool JSON and needs no card DB.
+      //
+      //    The kind gate is required, not stylistic: widening this to all
+      //    set-backed pools would turn the landed "skips the CARD_DB fetch for Set pods"
+      //    row (fixture `kind: "Premier"`) red.
+      if (config.poolInput.type === "Cube" || config.kind === "CommanderDraft") {
         const resp = await fetch(__CARD_DATA_URL__);
         abortIfRequested();
         if (!resp.ok) {
@@ -275,6 +298,7 @@ export class DraftPodHostAdapter {
         undefined, // default grace period
         config.persistenceId,
         hostResult.roomCode,
+        config.backupEndpoint,
       );
       pendingHost = host;
 
@@ -292,6 +316,7 @@ export class DraftPodHostAdapter {
           abortIfRequested();
           if (view) {
             this.setStatus(hostStatusForView(view));
+            this.emit({ type: "workspaceRestored", workspaceState: host.getHostWorkspaceState() });
             this.emit({ type: "viewUpdated", view });
           }
         }
@@ -370,7 +395,7 @@ export class DraftPodHostAdapter {
         this.emit({
           type: "pickReceived",
           seatIndex: event.seatIndex,
-          cardInstanceId: event.cardInstanceId,
+          cardInstanceIds: event.cardInstanceIds,
         });
         break;
       case "roundComplete":
@@ -384,7 +409,13 @@ export class DraftPodHostAdapter {
         this.emit({ type: "deckSubmitted", seatIndex: event.seatIndex });
         break;
       case "allDecksSubmitted":
-        this.setStatus("pairing");
+        // Shape B: no status is written here. `allDecksSubmitted` fires for
+        // EVERY pod kind, and this arm cannot know which one — a
+        // `PostDraftPlay::CompleteImmediately` pod is already `Complete`
+        // (draft-core session.rs:902), so writing "pairing" here overwrote the
+        // reducer's own answer. The `viewUpdated` the host broadcasts on the
+        // next line of its funnel carries the engine-published status, and the
+        // `viewUpdated` case below maps it through `hostStatusForView`.
         this.emit({ type: "allDecksSubmitted" });
         break;
       case "draftPaused":
@@ -397,6 +428,17 @@ export class DraftPodHostAdapter {
         this.emit({ type: "error", message: event.message });
         break;
       case "viewUpdated":
+        // The engine-published view is the single status authority, matching
+        // the restore path (:249-250) and `draftStarted` (:306-307).
+        // `setStatus` goes BEFORE the emit, so the store sees `statusChanged`
+        // first (writing `phase` and a no-view `saveDraftPodProgress`) and
+        // `viewUpdated` second (writing `phase` again and the VIEW-CARRYING
+        // `saveDraftPodProgress`). That order is a readability choice, not a
+        // correctness one: `saveDraftPodProgress` re-reads meta and writes
+        // `view?.pool.length ?? meta.pickCount`, so the no-view form echoes
+        // back whatever the view-carrying form persisted rather than clearing
+        // it, and either order leaves the same record.
+        this.setStatus(hostStatusForView(event.view));
         this.emit({ type: "viewUpdated", view: event.view });
         break;
       case "pairingsGenerated":
@@ -406,6 +448,15 @@ export class DraftPodHostAdapter {
       case "matchStart":
         this.setStatus("matchInProgress");
         this.emit({ type: "matchStart", launch: event.launch });
+        break;
+      case "commanderLaunch":
+        // Shape B, deliberately UNLIKE `matchStart` above: no status is written
+        // here. A Commander launch does not change pod phase — the pod stays
+        // `complete`, and the host must stay on `CompleteView` so its
+        // launch-in-flight state and Cancel control can render. Writing
+        // "matchInProgress" here would be the same overwrite of the reducer's
+        // own answer that `allDecksSubmitted` documents above.
+        this.emit({ type: "commanderLaunch", launch: event.launch });
         break;
       case "matchResultReceived":
         this.emit({ type: "matchResultReceived", matchId: event.matchId, winnerSeat: event.winnerSeat });
@@ -466,9 +517,9 @@ export class DraftPodHostAdapter {
     await this.host.startDraft(botFillEmptySeats);
   }
 
-  async submitPick(cardInstanceId: string): Promise<DraftPlayerView> {
+  async submitPick(cardInstanceIds: string[]): Promise<DraftPlayerView> {
     if (!this.host) throw new Error("Host not initialized");
-    return this.host.submitHostPick(cardInstanceId);
+    return this.host.submitHostPick(cardInstanceIds);
   }
 
   async submitPickWithDraftEffect(
@@ -479,9 +530,19 @@ export class DraftPodHostAdapter {
     return this.host.submitHostPickWithDraftEffect(effectCardInstanceId, cardInstanceIds);
   }
 
-  async submitDeck(mainDeck: string[]): Promise<DraftPlayerView> {
+  async submitDeck(mainDeck: string[], commanders: string[]): Promise<DraftPlayerView> {
     if (!this.host) throw new Error("Host not initialized");
-    return this.host.submitHostDeck(mainDeck);
+    return this.host.submitHostDeck(mainDeck, commanders);
+  }
+
+  async updateWorkspace(state: DraftWorkspaceState): Promise<void> {
+    if (!this.host) throw new Error("Host not initialized");
+    await this.host.updateHostWorkspace(state);
+  }
+
+  async suggestLands(): Promise<Record<string, number>> {
+    if (!this.host) throw new Error("Host not initialized");
+    return this.host.suggestLandsForSeat(0);
   }
 
   async getHostView(): Promise<DraftPlayerView> {
@@ -509,6 +570,44 @@ export class DraftPodHostAdapter {
   async submitMatchSettlement(settlement: DraftMatchSettlement): Promise<void> {
     if (!this.host) throw new Error("Host not initialized");
     await this.host.submitHostMatchSettlement(settlement);
+  }
+
+  /**
+   * CR 903.13a: the N-seat deck payload a completed Commander pod launches a
+   * LOCAL multiplayer game from, used above the P2P seat ceiling. The store
+   * holds this wrapper, not the underlying `P2PDraftHost`, so every host call
+   * goes through a delegate like this one.
+   */
+  async podCommanderDeckPayload(
+    view: DraftPlayerView,
+    localSeat: number,
+  ): Promise<DraftMatchDeckPayload> {
+    if (!this.host) throw new Error("Host not initialized");
+    return this.host.podCommanderDeckPayload(view, localSeat);
+  }
+
+  /**
+   * CR 903.13a: every deck the completed Commander pod's launch needs. Sends
+   * nothing — pair it with `sendCommanderLaunches` once the game is up. `view`
+   * must be read at call time — see `P2PDraftHost.commanderSeatDecks`.
+   */
+  async commanderSeatDecks(view: DraftPlayerView, localSeat: number): Promise<CommanderSeatDecks> {
+    if (!this.host) throw new Error("Host not initialized");
+    return this.host.commanderSeatDecks(view, localSeat);
+  }
+
+  /**
+   * CR 903.13a: put the pod's launch on every live human seat, the host's own
+   * included, from decks `commanderSeatDecks` already computed.
+   */
+  sendCommanderLaunches(
+    view: DraftPlayerView,
+    gameId: string,
+    roomCode: string,
+    decks: CommanderSeatDecks,
+  ): void {
+    if (!this.host) throw new Error("Host not initialized");
+    this.host.sendCommanderLaunches(view, gameId, roomCode, decks);
   }
 
   async replaceSeatWithBot(seat: number): Promise<void> {

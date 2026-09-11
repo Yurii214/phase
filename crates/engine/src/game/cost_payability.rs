@@ -82,6 +82,7 @@ pub(crate) fn target_filter_has_x_mana_value_constraint(filter: &TargetFilter) -
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -262,6 +263,7 @@ pub(crate) fn relax_x_mana_value_constraint(filter: &TargetFilter) -> TargetFilt
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -326,6 +328,53 @@ impl AbilityCost {
         ability_index: usize,
     ) -> bool {
         match self {
+            AbilityCost::Discard {
+                count,
+                filter,
+                self_scope,
+                ..
+            } => {
+                let reserved = state
+                    .pending_cast
+                    .as_ref()
+                    .filter(|pending| pending.ability.controller == player)
+                    .and_then(|pending| {
+                        pending
+                            .deferred_random_discard_cost
+                            .as_ref()
+                            .map(|cost| (pending.object_id, cost.count))
+                    });
+                if reserved.is_none() {
+                    return self.is_payable(state, player, source);
+                }
+                let (pending_spell, reserved_count) = reserved.expect("checked reservation");
+                let Some(p) = state.players.get(player.0 as usize) else {
+                    return false;
+                };
+                if self_scope.is_source_card() {
+                    return p.hand.contains(&source)
+                        && p.hand
+                            .iter()
+                            .filter(|&&id| id != source && id != pending_spell)
+                            .count()
+                            >= reserved_count;
+                }
+                let resolved =
+                    super::quantity::resolve_quantity(state, count, player, source).max(0) as usize;
+                let effective_filter = cost_filter_before_x_announcement(filter.as_ref());
+                let ctx = FilterContext::from_source(state, source);
+                p.hand
+                    .iter()
+                    .filter(|&&id| {
+                        id != source
+                            && id != pending_spell
+                            && effective_filter
+                                .as_ref()
+                                .is_none_or(|f| matches_target_filter(state, id, f, &ctx))
+                    })
+                    .count()
+                    >= resolved + reserved_count
+            }
             AbilityCost::Mana { cost } => {
                 let excluded_sources = std::collections::HashSet::from([source]);
                 super::casting::can_pay_ability_mana_cost_after_auto_tap_excluding(
@@ -696,9 +745,16 @@ impl AbilityCost {
                 .len()
                     >= *count as usize
             }
-            // CR 701.13b: A player can mill fewer than N cards if their library
-            // has fewer than N; the cost is always payable.
-            AbilityCost::Mill { .. } => true,
+            // CR 701.17b: "the player can't pay a cost that includes milling a
+            // number of cards greater than the number of cards in their
+            // library." The same rule's "if instructed to do so, they mill as
+            // many as possible" allowance governs milling as an *effect* and
+            // must not be read onto a cost. `count` is a plain `u32`, so no
+            // quantity resolution is needed.
+            AbilityCost::Mill { count } => state
+                .players
+                .get(player.0 as usize)
+                .is_some_and(|p| p.library.len() >= *count as usize),
             // CR 701.43b: A permanent can be exerted even if it's not tapped
             // or has already been exerted; the cost itself is always payable.
             // CR 701.43c (off-battlefield) is enforced at payment time.
@@ -1529,10 +1585,45 @@ mod tests {
         assert!(!unpayable.is_payable(&state, P0, ObjectId(0)));
     }
 
+    /// CR 701.17b: a Mill cost is payable iff the library holds at least
+    /// `count` cards. The predicate is swept across its whole input range
+    /// against one fixed 4-card library so the boundary is pinned from both
+    /// sides: below it, at it, and above it. The previous behaviour returned
+    /// `true` unconditionally and is falsified by every `count > 4` row.
+    ///
+    /// The empty-library row is the case the old comment got backwards — it
+    /// claimed a short library still pays "as many as possible", which is the
+    /// rule for milling as an *effect*, not as a cost.
     #[test]
-    fn mill_exert_always_payable() {
+    fn mill_payable_iff_library_holds_count() {
+        let mut scenario = GameScenario::new();
+        scenario.with_library_top(P0, &["Top A", "Top B", "Top C", "Top D"]);
+        let state = &scenario.state;
+
+        for count in 0..=4 {
+            assert!(
+                AbilityCost::Mill { count }.is_payable(state, P0, ObjectId(0)),
+                "mill {count} must be payable from a 4-card library"
+            );
+        }
+        for count in 5..=8 {
+            assert!(
+                !AbilityCost::Mill { count }.is_payable(state, P0, ObjectId(0)),
+                "mill {count} exceeds a 4-card library and must be unpayable"
+            );
+        }
+
+        // Empty library: only the degenerate zero-card mill remains payable.
+        let empty = new_state();
+        assert!(AbilityCost::Mill { count: 0 }.is_payable(&empty, P0, ObjectId(0)));
+        assert!(!AbilityCost::Mill { count: 1 }.is_payable(&empty, P0, ObjectId(0)));
+    }
+
+    /// CR 701.43b: exert is payable regardless of the source's tapped state,
+    /// so an empty library (which now blocks a Mill cost) leaves it untouched.
+    #[test]
+    fn exert_always_payable() {
         let state = new_state();
-        assert!(AbilityCost::Mill { count: 5 }.is_payable(&state, P0, ObjectId(0)));
         assert!(AbilityCost::Exert.is_payable(&state, P0, ObjectId(0)));
     }
 

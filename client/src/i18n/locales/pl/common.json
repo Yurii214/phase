@@ -5,6 +5,10 @@
     "close": "Zamknij",
     "closeNamed": "Zamknij {{name}}"
   },
+  "debug": {
+    "exportAuthoritative": "Eksportuj autorytatywny stan gry",
+    "exportAuthoritativeTitle": "Pobiera stan należący do silnika, używany do diagnozowania i przywracania tej gry"
+  },
   "quantityRef": {
     "highestNumber": "najwyższa liczba",
     "lowestNumber": "najniższa liczba",
@@ -20,7 +24,7 @@
   },
   "pausedBanner": {
     "message": "Gra wstrzymana — {{reason}}",
-    "resume": "Wznów"
+    "resume": "Wznów grę"
   },
   "fullscreen": {
     "enter": "Włącz pełny ekran",
@@ -58,10 +62,15 @@
     "updateIssue": "problem z aktualizacją",
     "updated": "zaktualizowano"
   },
+  "offlineBadge": {
+    "label": "Offline",
+    "servicesPaused": "Aktualizacje i usługi online są wstrzymane.",
+    "forced": "Tryb pracy offline jest włączony.",
+    "connection": "Brak połączenia sieciowego."
+  },
   "comboDetector": {
     "label": "Wykrywacz combosów (eksperymentalne)",
     "title": "Wykrywaj nieskończone pętle: automatycznie kończ obowiązkowe pętle i pokazuj zasoby ∞ (domyślnie wyłączone)",
-    "on": "Wł.",
     "off": "Wył.",
     "interactive": "Interaktywny"
   },
@@ -79,7 +88,8 @@
     "clickModeButton": "Przycisk trybu kliknięcia",
     "shown": "Widoczny",
     "hidden": "Ukryty",
-    "resume": "Wznów",
+    "openGameLog": "Otwórz dziennik gry",
+    "closeGameLog": "Zamknij dziennik gry",
     "settings": "Ustawienia",
     "boardLayoutSplit": "Podzielony",
     "boardLayoutLegacy": "Legacy",
@@ -103,6 +113,7 @@
   },
   "volume": {
     "deviceBlocked": "Dźwięk niedostępny — serwer audio systemu nie odpowiada. Uruchom aplikację ponownie, aby spróbować jeszcze raz.",
+    "mediaUnavailable": "Dźwięk niedostępny — w tym systemie brakuje komponentów multimedialnych potrzebnych do odtwarzania dźwięku. Zainstaluj pakiety wtyczek GStreamer swojej dystrybucji i uruchom aplikację ponownie.",
     "mute": "Wycisz",
     "unmute": "Wyłącz wyciszenie",
     "volume": "Głośność"
@@ -295,7 +306,15 @@
     "back": "Wstecz",
     "settings": "Ustawienia",
     "languageSettings": "Język ({{lang}}) — otwórz ustawienia",
-    "languageTitle": "Język: {{lang}}"
+    "languageTitle": "Język: {{lang}}",
+    "statusBanner": {
+      "dismiss": "Zamknij tę wiadomość",
+      "severity": {
+        "info": "Informacja",
+        "warning": "Uwaga",
+        "critical": "Ważne"
+      }
+    }
   },
   "errorBoundary": {
     "heading": "Coś poszło nie tak",

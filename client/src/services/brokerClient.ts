@@ -7,11 +7,42 @@ import type {
   PeerInfo,
 } from "../adapter/types";
 import type { ServerInfo } from "../adapter/ws-adapter";
+import { isFormatConfigShape } from "../adapter/format-config-shape";
 import {
   HandshakeError,
   openPhaseSocket,
   type PhaseSocket,
 } from "./openPhaseSocket";
+import { startSocketKeepalive } from "./socketKeepalive";
+
+/**
+ * Structurally validate the `format_config` on a broker-sent `PeerInfo` /
+ * `JoinTargetInfo` before the rest of the client trusts it.
+ *
+ * These frames arrive via `JSON.parse` and are cast straight to their TS type,
+ * which is erased at runtime — nothing else validates their shape, and this is
+ * the one wire direction where no per-frame rejection exists (see
+ * `MIN_SUPPORTED_LOBBY_PROTOCOL`'s doc in `crates/lobby-broker/src/protocol.rs`).
+ * A stale or malformed config would otherwise reach code reading
+ * `.min_players`, `.deck_size.type`, `.custom_rules`, and so on.
+ *
+ * A bad config is dropped to `null` rather than failing the whole frame:
+ * `format_config` is already optional on both types, every consumer handles its
+ * absence (they read it as `format_config?.format ?? fallback`), and the
+ * peer id / game code the frame primarily carries are still good. Failing the
+ * frame would deny a join over a field used only for a pre-flight hint.
+ */
+function withValidatedFormatConfig<T extends { format_config?: FormatConfig | null }>(
+  info: T,
+): T {
+  if (info.format_config == null) return info;
+  if (isFormatConfigShape(info.format_config)) return info;
+  console.warn(
+    "[broker] dropping a malformed format_config from a lobby frame; "
+      + "the room's format will be treated as unknown",
+  );
+  return { ...info, format_config: null };
+}
 
 export interface RegisterHostRequest {
   /** PeerJS peer ID guests dial to reach the host's engine. */
@@ -121,9 +152,17 @@ export async function openBrokerClient(
   return makeBrokerClient(socket);
 }
 
-function makeBrokerClient(socket: PhaseSocket): BrokerClient {
+/**
+ * Exported for the same reason as `lookupJoinTargetOver` and friends: the
+ * socket-taking form is what a test can drive.
+ */
+export function makeBrokerClient(socket: PhaseSocket): BrokerClient {
   const { ws, serverInfo } = socket;
   let closed = false;
+  // Losing this socket to an idle-timeout makes the broker delist the room
+  // while the host still believes it is hosting.
+  const stopKeepalive = startSocketKeepalive(ws);
+  ws.addEventListener("close", stopKeepalive, { once: true });
 
   const registerHost = (req: RegisterHostRequest): Promise<RegisteredGame> => {
     return new Promise<RegisteredGame>((resolve, reject) => {
@@ -232,6 +271,7 @@ function makeBrokerClient(socket: PhaseSocket): BrokerClient {
     close: () => {
       if (closed) return;
       closed = true;
+      stopKeepalive();
       socket.close();
     },
   };
@@ -346,7 +386,7 @@ export function resolveGuestOver(
         const data = msg.data as PeerInfo;
         if (data.game_code !== code) return;
         cleanup();
-        resolve({ ok: true, peerInfo: data });
+        resolve({ ok: true, peerInfo: withValidatedFormatConfig(data) });
       } else if (msg.type === "PasswordRequired") {
         const data = msg.data as { game_code: string };
         if (data.game_code !== code) return;
@@ -464,7 +504,7 @@ export function lookupJoinTargetOver(
         const data = msg.data as JoinTargetInfo;
         if (data.game_code !== code) return;
         cleanup();
-        resolve({ ok: true, info: data });
+        resolve({ ok: true, info: withValidatedFormatConfig(data) });
       } else if (msg.type === "PasswordRequired") {
         const data = msg.data as { game_code: string };
         if (data.game_code !== code) return;

@@ -6,7 +6,7 @@ use crate::types::ability::{
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
-use crate::types::game_state::{BattlefieldEntryRecord, CastingVariant};
+use crate::types::game_state::{BattlefieldEntryRecord, CastOccurrence, CastingVariant};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost};
 use crate::types::phase::Phase;
@@ -203,14 +203,15 @@ pub fn record_spell_cast(
     player: PlayerId,
     obj: &GameObject,
     cast_variant: crate::types::game_state::CastingVariant,
-) {
+) -> Result<CastOccurrence, crate::types::resolved_commands::ResolvedLedgerEditReplayInvariantError>
+{
     record_spell_cast_from_zone(
         state,
         player,
         obj,
         obj.cast_from_zone.unwrap_or(Zone::Hand),
         cast_variant,
-    );
+    )
 }
 
 /// CR 708.4: Project a spell-cast record for a LIVE per-spell filter seam, which
@@ -289,11 +290,11 @@ pub fn record_spell_cast_from_zone(
     obj: &GameObject,
     from_zone: Zone,
     cast_variant: crate::types::game_state::CastingVariant,
-) {
+) -> Result<CastOccurrence, crate::types::resolved_commands::ResolvedLedgerEditReplayInvariantError>
+{
     // CR 117.1: Record spell characteristics for general-purpose filtered counting.
     let record = spell_cast_record_for(obj, from_zone, cast_variant, false);
     crate::game::ledger::record_spell_cast(state, player, record)
-        .expect("finalized spell cast must have a valid ledger prefix");
 }
 
 /// CR 702.185c: True when any player cast a spell using `variant` this turn.
@@ -1141,12 +1142,13 @@ fn activation_restriction_applies(
             .objects
             .get(&source_id)
             .is_some_and(|obj| obj.harnessed),
-        // CR 716.4: Level N+1 ability can only activate when Class is at level N.
+        // CR 716.2a: "[Cost]: Level N" activates only while the Class is level N-1.
+        // CR 716.2d: a source with no stored level is level 1, so a Class copy
+        // (Mirrormade) can gain its first level like any printed Class.
         ActivationRestriction::ClassLevelIs { level } => state
             .objects
             .get(&source_id)
-            .and_then(|obj| obj.class_level)
-            .is_some_and(|current| current == *level),
+            .is_some_and(|obj| obj.level() == *level),
         // CR 711.2a + CR 711.2b: Leveler counter range — activatable when source has
         // level counters in the specified range [minimum, maximum] (or >= minimum if unbounded).
         ActivationRestriction::LevelCounterRange { minimum, maximum } => {
@@ -1669,6 +1671,22 @@ pub(crate) fn evaluate_condition(
         // CR 702.195b: The enduring story is a player designation effects and
         // restrictions may identify.
         ParsedCondition::HasEnduringStory => state.enduring_story.contains(&player),
+        // CR 309.7: "A player completes a dungeon as that dungeon card is removed
+        // from the game." CR 602.5b makes the printed "Activate only if you've
+        // completed a dungeon" (Sarevok's Tome) a restriction on the ability's use.
+        //
+        // Activator-relative like its designation siblings above, not
+        // source-relative like `HasMaxSpeed`: the clause prints "if YOU'VE
+        // completed", addressed to whoever is activating.
+        //
+        // Delegates to the single `game::dungeon` authority that
+        // `AbilityCondition::CompletedDungeon` and
+        // `TriggerCondition::CompletedDungeon` also call, so the restriction
+        // reading of this clause cannot disagree with the resolution and
+        // intervening-if readings about what "completed" means.
+        ParsedCondition::CompletedDungeon { specific } => {
+            crate::game::dungeon::has_completed_dungeon(state, player, specific)
+        }
         // CR 702.178a + the "Max Speed" glossary entry, sense 2: the keyword
         // grants its ability "only if that permanent's controller (or that
         // card's owner, if it isn't on the battlefield) has a speed of 4".
@@ -2506,6 +2524,75 @@ mod tests {
         assert!(!evaluate_condition(&state, player, source_id, &condition));
         state.city_blessing.insert(player);
         assert!(evaluate_condition(&state, player, source_id, &condition));
+    }
+
+    /// CR 309.7 + CR 602.5b: Sarevok's Tome's "Activate only if you've completed
+    /// a dungeon". Peer of the two designation tests around it, and the
+    /// restriction-layer half of the gate: parsing the clause is only half the
+    /// fix — before this variant existed the phrase failed to convert and the
+    /// ability was activatable with no dungeon requirement at all.
+    ///
+    /// Also pins the per-player scoping: an opponent's completion must not
+    /// satisfy your gate, since `dungeon_progress` is keyed by player.
+    #[test]
+    fn completed_dungeon_restriction_checks_player_progress() {
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let player = PlayerId(0);
+        let opponent = PlayerId(1);
+        let source_id = ObjectId(10);
+        let condition = ParsedCondition::CompletedDungeon { specific: None };
+
+        assert!(!evaluate_condition(&state, player, source_id, &condition));
+
+        // An opponent's completed dungeon must not satisfy your gate.
+        state
+            .dungeon_progress
+            .entry(opponent)
+            .or_default()
+            .completed
+            .insert(crate::game::dungeon::DungeonId::TombOfAnnihilation);
+        assert!(!evaluate_condition(&state, player, source_id, &condition));
+
+        state
+            .dungeon_progress
+            .entry(player)
+            .or_default()
+            .completed
+            .insert(crate::game::dungeon::DungeonId::TombOfAnnihilation);
+        assert!(evaluate_condition(&state, player, source_id, &condition));
+    }
+
+    /// CR 309.7: the `specific` axis must discriminate — completing one dungeon
+    /// does not satisfy a gate naming a different one. Guards the field against
+    /// collapsing into the unqualified reading.
+    #[test]
+    fn completed_dungeon_restriction_honors_specific_dungeon() {
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let player = PlayerId(0);
+        let source_id = ObjectId(10);
+        state
+            .dungeon_progress
+            .entry(player)
+            .or_default()
+            .completed
+            .insert(crate::game::dungeon::DungeonId::TombOfAnnihilation);
+
+        assert!(evaluate_condition(
+            &state,
+            player,
+            source_id,
+            &ParsedCondition::CompletedDungeon {
+                specific: Some(crate::game::dungeon::DungeonId::TombOfAnnihilation),
+            }
+        ));
+        assert!(!evaluate_condition(
+            &state,
+            player,
+            source_id,
+            &ParsedCondition::CompletedDungeon {
+                specific: Some(crate::game::dungeon::DungeonId::Undercity),
+            }
+        ));
     }
 
     #[test]
@@ -4586,7 +4673,8 @@ mod tests {
             caster,
             &approach,
             crate::types::game_state::CastingVariant::Normal,
-        );
+        )
+        .expect("test spell-cast ledger is valid");
         let history = state
             .spells_cast_this_game_by_player
             .get(&caster)
@@ -4609,7 +4697,8 @@ mod tests {
             caster,
             &approach,
             crate::types::game_state::CastingVariant::Normal,
-        );
+        )
+        .expect("test spell-cast ledger is valid");
         assert_eq!(
             resolve_quantity(&state, &approach_count, caster, ObjectId(10)),
             2,
@@ -4624,7 +4713,8 @@ mod tests {
             opponent,
             &approach,
             crate::types::game_state::CastingVariant::Normal,
-        );
+        )
+        .expect("test spell-cast ledger is valid");
         assert_eq!(
             resolve_quantity(&state, &approach_count, caster, ObjectId(10)),
             2,
@@ -4659,7 +4749,8 @@ mod tests {
         ));
 
         // A normal cast records `CastingVariant::Normal` → warp query still false.
-        record_spell_cast(&mut state, caster, &spell, CastingVariant::Normal);
+        record_spell_cast(&mut state, caster, &spell, CastingVariant::Normal)
+            .expect("test spell-cast ledger is valid");
         assert_eq!(
             state.spells_cast_this_turn_by_player[&caster][0].cast_variant,
             CastingVariant::Normal
@@ -4670,7 +4761,8 @@ mod tests {
         ));
 
         // A warp cast records `CastingVariant::Warp` → warp query becomes true.
-        record_spell_cast(&mut state, caster, &spell, CastingVariant::Warp);
+        record_spell_cast(&mut state, caster, &spell, CastingVariant::Warp)
+            .expect("test spell-cast ledger is valid");
         assert_eq!(
             state.spells_cast_this_turn_by_player[&caster][1].cast_variant,
             CastingVariant::Warp

@@ -1,5 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const { lanSupported, probeLan, authorizeLan, invokeLan, channelListener } = vi.hoisted(() => ({
+  lanSupported: vi.fn(), probeLan: vi.fn(), authorizeLan: vi.fn(), invokeLan: vi.fn(),
+  channelListener: { current: null as null | ((event: unknown) => void) },
+}));
+vi.mock("../lan", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../lan")>(),
+  canUseLanBridge: lanSupported, initializeLanCapabilities: probeLan, authorizeLanServer: authorizeLan,
+}));
+vi.mock("../platform", () => ({ isDesktopTauri: () => true }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: invokeLan,
+  Channel: class { constructor(callback: (event: unknown) => void) { channelListener.current = callback; } },
+}));
+
 import {
   HandshakeError,
   openPhaseSocket,
@@ -8,6 +22,7 @@ import {
 import {
   LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL,
   LOBBY_PROTOCOL_VERSION,
+  MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL,
   PROTOCOL_VERSION,
 } from "../../adapter/ws-adapter";
 
@@ -15,8 +30,9 @@ class MockWebSocket extends EventTarget {
   static OPEN = 1;
   static instances: MockWebSocket[] = [];
   readyState = MockWebSocket.OPEN;
+  binaryType: BinaryType = "blob";
   onopen: (() => void) | null = null;
-  onmessage: ((event: { data: string }) => void) | null = null;
+  onmessage: ((event: { data: unknown }) => void) | null = null;
   onerror: (() => void) | null = null;
   onclose: (() => void) | null = null;
   send = vi.fn();
@@ -28,7 +44,7 @@ class MockWebSocket extends EventTarget {
     super();
     MockWebSocket.instances.push(this);
   }
-  deliverMessage(data: string) {
+  deliverMessage(data: unknown) {
     this.onmessage?.({ data });
   }
   fireError() {
@@ -43,6 +59,7 @@ function helloFrame(
     protocol_version: number;
     mode: "Full" | "LobbyOnly";
     lobby_protocol_version: number;
+    wire_formats: string[];
   }> = {},
 ): string {
   return JSON.stringify({
@@ -58,6 +75,9 @@ function helloFrame(
 }
 
 beforeEach(() => {
+  lanSupported.mockReturnValue(false); probeLan.mockResolvedValue(false);
+  authorizeLan.mockReset().mockResolvedValue(undefined);
+  invokeLan.mockResolvedValue(41); channelListener.current = null;
   MockWebSocket.instances = [];
   vi.stubGlobal("WebSocket", MockWebSocket);
 });
@@ -85,6 +105,53 @@ describe("openPhaseSocket", () => {
     );
   });
 
+  it("negotiates the gzip envelope and queues binary sends in order", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const raw = MockWebSocket.instances[0];
+    raw.deliverMessage(helloFrame({ wire_formats: ["GzipEnvelopeV1"] }));
+
+    const socket = await promise;
+    expect(socket.serverInfo.wireFormats).toEqual(["GzipEnvelopeV1"]);
+    expect(raw.send).toHaveBeenCalledWith(
+      expect.stringContaining('"wire_formats":["GzipEnvelopeV1"]'),
+    );
+
+    socket.ws.send(JSON.stringify({ type: "Ping", data: { timestamp: 7 } }));
+    await vi.waitFor(() => {
+      expect(raw.send).toHaveBeenCalledWith(expect.any(Uint8Array));
+    });
+    const binary = raw.send.mock.calls.find(([value]) => value instanceof Uint8Array)?.[0];
+    expect(binary?.[0]).toBe(0x00);
+
+    const order: string[] = [];
+    const received = vi.fn((_event: MessageEvent<string>) => order.push("message"));
+    socket.ws.onmessage = received;
+    socket.ws.addEventListener("close", () => order.push("close"));
+    const response = new TextEncoder().encode(JSON.stringify({ type: "Pong" }));
+    raw.deliverMessage(new Uint8Array([0x00, ...response]).buffer);
+    raw.close();
+    await vi.waitFor(() => expect(received).toHaveBeenCalledOnce());
+    expect(received).toHaveBeenCalledWith(expect.objectContaining({ data: '{"type":"Pong"}' }));
+    expect(order).toEqual(["message", "close"]);
+  });
+
+  it("reports a queued binary send failure before closing", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const raw = MockWebSocket.instances[0];
+    raw.deliverMessage(helloFrame({ wire_formats: ["GzipEnvelopeV1"] }));
+
+    const socket = await promise;
+    const onerror = vi.fn();
+    socket.ws.onerror = onerror;
+    raw.send.mockImplementationOnce(() => {
+      throw new Error("socket closed before queued send");
+    });
+    socket.ws.send('{"type":"Ping"}');
+
+    await vi.waitFor(() => expect(onerror).toHaveBeenCalledOnce());
+    expect(raw.close).toHaveBeenCalled();
+  });
+
   it("rejects with protocol_mismatch when versions diverge and closes the socket", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
@@ -94,7 +161,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects the previous protocol version for Full servers", async () => {
+  it("rejects the immediately previous Full protocol before it can omit storm_count", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: PROTOCOL_VERSION - 1 }));
@@ -183,7 +250,11 @@ describe("openPhaseSocket", () => {
     ws.deliverMessage(
       helloFrame({
         mode: "LobbyOnly",
-        lobby_protocol_version: LOBBY_PROTOCOL_VERSION - 1,
+        // Measured against the FLOOR, not against this client's own version:
+        // an additive bump moves LOBBY_PROTOCOL_VERSION without moving
+        // MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL, so `version - 1` is not
+        // necessarily below the floor at all.
+        lobby_protocol_version: MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL - 1,
       }),
     );
 
@@ -254,7 +325,9 @@ describe("openPhaseSocket", () => {
       helloFrame({
         protocol_version: PROTOCOL_VERSION,
         mode: "Full",
-        lobby_protocol_version: LOBBY_PROTOCOL_VERSION - 1,
+        // See above: below the floor, which is not the same as one below the
+        // client's own lobby version.
+        lobby_protocol_version: MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL - 1,
       }),
     );
 
@@ -393,5 +466,108 @@ describe("withReconnect", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+
+describe("LAN default transport", () => {
+  it("waits for native approval before opening a socket or starting its timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      lanSupported.mockReturnValue(true); probeLan.mockResolvedValue(true);
+      let approve!: () => void;
+      authorizeLan.mockImplementation(() => new Promise<void>((resolve) => { approve = resolve; }));
+      const pending = openPhaseSocket("ws://192.168.1.2:9374/ws", { timeoutMs: 20 });
+      await vi.advanceTimersByTimeAsync(30);
+      expect(authorizeLan).toHaveBeenCalledOnce();
+      expect(channelListener.current).toBeNull();
+      expect(MockWebSocket.instances).toHaveLength(0);
+      approve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(channelListener.current).not.toBeNull();
+      channelListener.current?.({ type: "message", text: helloFrame() });
+      (await pending).close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["resolve", "reject"] as const)("aborts a pending capability probe before its late %s", async (completion) => {
+    lanSupported.mockReturnValue(true);
+    let complete!: () => void;
+    const probe = new Promise<boolean>((resolve, reject) => {
+      complete = () => completion === "resolve" ? resolve(true) : reject(new Error("Late probe failure"));
+    });
+    probeLan.mockReturnValue(probe);
+    const controller = new AbortController();
+    const pending = openPhaseSocket("ws://192.168.1.2:9374/ws", { signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    complete();
+    await probe.catch(() => {});
+    expect(authorizeLan).not.toHaveBeenCalled();
+    expect(channelListener.current).toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  it.each(["resolve", "reject"] as const)("aborts pending native approval before its late %s", async (completion) => {
+    lanSupported.mockReturnValue(true); probeLan.mockResolvedValue(true);
+    let complete!: () => void;
+    const approval = new Promise<void>((resolve, reject) => {
+      complete = () => completion === "resolve" ? resolve() : reject(new Error("Late approval failure"));
+    });
+    authorizeLan.mockReturnValue(approval);
+    const controller = new AbortController();
+    const pending = openPhaseSocket("ws://192.168.1.2:9374/ws", { signal: controller.signal });
+    await vi.waitFor(() => expect(authorizeLan).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    complete();
+    await approval.catch(() => {});
+    expect(channelListener.current).toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  it("never opens a socket when native approval is rejected", async () => {
+    lanSupported.mockReturnValue(true); probeLan.mockResolvedValue(true);
+    authorizeLan.mockRejectedValue(new Error("LAN approval denied"));
+    await expect(openPhaseSocket("ws://192.168.1.2:9374/ws")).rejects.toThrow("LAN approval denied");
+    expect(channelListener.current).toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  it("selects native IPC after its capability probe and negotiates text only", async () => {
+    lanSupported.mockReturnValue(true); probeLan.mockResolvedValue(true);
+    const pending = openPhaseSocket("ws://192.168.1.2:9374/ws");
+    await vi.waitFor(() => expect(channelListener.current).not.toBeNull());
+    channelListener.current?.({ type: "message", text: helloFrame({ wire_formats: ["GzipEnvelopeV1"] }) });
+    const socket = await pending;
+    expect(MockWebSocket.instances).toHaveLength(0);
+    expect(invokeLan).toHaveBeenCalledWith("connect_lan_server", expect.objectContaining({ url: "ws://192.168.1.2:9374/ws" }));
+    expect(invokeLan).toHaveBeenCalledWith("lan_bridge_send", {
+      id: 41, text: expect.stringContaining('"wire_formats":[]'),
+    });
+    socket.close();
+  });
+
+  it("keeps an explicit factory authoritative for a LAN address", async () => {
+    lanSupported.mockReturnValue(true);
+    const factory = vi.fn((url: string) => new MockWebSocket(url) as unknown as WebSocket);
+    const pending = openPhaseSocket("ws://192.168.1.2:9374/ws", { socketFactory: factory });
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame());
+    (await pending).close();
+    expect(factory).toHaveBeenCalledOnce();
+    expect(authorizeLan).not.toHaveBeenCalled();
+    expect(channelListener.current).toBeNull();
+  });
+
+  it("keeps browser and old-shell LAN connections on WebSocket", async () => {
+    const pending = openPhaseSocket("ws://192.168.1.2:9374/ws");
+    await vi.waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    MockWebSocket.instances[0].deliverMessage(helloFrame());
+    (await pending).close();
+    expect(authorizeLan).not.toHaveBeenCalled();
+    expect(channelListener.current).toBeNull();
   });
 });

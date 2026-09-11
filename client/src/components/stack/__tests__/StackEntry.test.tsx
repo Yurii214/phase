@@ -151,6 +151,23 @@ describe("StackEntry", () => {
     vi.useRealTimers();
   });
 
+  it("identifies the represented stack object and compact group for contextual errors", () => {
+    const entry = buildStackEntry({ id: 77, source_id: 42 });
+
+    render(
+      <StackEntry
+        entry={entry}
+        groupedObjectIds={[77, 78]}
+        index={0}
+        isTop
+        cardSize={{ width: 120, height: 168 }}
+      />,
+    );
+
+    expect(document.querySelector('[data-stack-entry="77"]')).toHaveAttribute("data-object-id", "77");
+    expect(document.querySelector('[data-stack-entry="77"]')).toHaveAttribute("data-grouped-ids", "77 78");
+  });
+
   it("offers Revoke for an AllCopies yield after the source token has ceased", () => {
     // CR 400.7 + CR 704.5d: a ceased token is gone from `objects`, so the entry
     // has no live source object to read a card_id from — the menu must match the
@@ -479,6 +496,80 @@ describe("StackEntry", () => {
     render(<StackEntry entry={entry} index={0} isTop cardSize={{ width: 120, height: 168 }} />);
 
     expect(screen.queryByTestId("unimplemented-mechanics-badge")).not.toBeInTheDocument();
+  });
+
+  // V11 (plan-r6 §Verification Matrix): the display must show the LIVE
+  // controller (CR 112.2 + CR 613.1b), not the by-default `entry.controller`,
+  // and it must do so per entry — `group_key` is not extended to carry it.
+  describe("live controller chrome", () => {
+    it("follows details.controller rather than the by-default entry.controller", () => {
+      // entry.controller stays the CR 112.2 by-default caster (self, seat 0);
+      // details.controller is the engine's LIVE answer (the opponent, after a
+      // steal) — the two are deliberately made to disagree so the assertion
+      // below can only pass if the chrome reads `details`.
+      const entry: StackEntryType = buildStackEntry({
+        id: 77,
+        source_id: 42,
+        controller: 0,
+        kind: { type: "Spell", data: { card_id: 1, actual_mana_spent: 0 } },
+      });
+      const gameState = createGameState({
+        objects: buildObjectMap(
+          buildGameObject({ id: 42, card_id: 1, name: "Stolen Spell", zone: "Stack" }),
+        ),
+        stack: [entry],
+      });
+
+      act(() => {
+        useGameStore.setState({ gameState, waitingFor: gameState.waiting_for });
+      });
+
+      render(
+        <StackEntry
+          entry={entry}
+          index={0}
+          isTop
+          cardSize={{ width: 120, height: 168 }}
+          details={{
+            source_name: "Stolen Spell",
+            kind_label: "Spell",
+            controller: 1,
+          }}
+        />,
+      );
+
+      // REVERT-FAILING: reverting the `details?.controller ?? entry.controller`
+      // fallback to a bare `entry.controller` read makes this badge show "You"/"Y".
+      expect(screen.getByTitle("Opp")).toBeInTheDocument();
+      expect(screen.getByText("P1")).toBeInTheDocument();
+      expect(screen.queryByTitle("You")).not.toBeInTheDocument();
+    });
+
+    it("falls back to entry.controller when details is absent, never to seat 0", () => {
+      // HOSTILE: `details` absent must not crash and must not silently
+      // default to PlayerId(0) — this is exactly why the TS field is optional.
+      const entry: StackEntryType = buildStackEntry({
+        id: 78,
+        source_id: 43,
+        controller: 1,
+        kind: { type: "Spell", data: { card_id: 2, actual_mana_spent: 0 } },
+      });
+      const gameState = createGameState({
+        objects: buildObjectMap(
+          buildGameObject({ id: 43, card_id: 2, name: "Opponent Spell", zone: "Stack" }),
+        ),
+        stack: [entry],
+      });
+
+      act(() => {
+        useGameStore.setState({ gameState, waitingFor: gameState.waiting_for });
+      });
+
+      render(<StackEntry entry={entry} index={0} isTop cardSize={{ width: 120, height: 168 }} />);
+
+      expect(screen.getByTitle("Opp")).toBeInTheDocument();
+      expect(screen.getByText("P1")).toBeInTheDocument();
+    });
   });
 
   // The stack must be a click surface for EVERY engine prompt whose legal set can
