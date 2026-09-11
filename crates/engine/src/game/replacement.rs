@@ -29,13 +29,14 @@ use crate::types::mana::{StepEndManaAction, UnitDisposition};
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::{
     AppliedReplacementKey, BoundSearchFoundCandidate, BoundSearchFoundDisposition,
-    BoundSearchFoundGrant, CopyTokenSpec, CounterMoveStage, CounterPlacement, EtbTapState,
-    ProposedEvent, ReplacementId, SearchFoundDisposition,
+    BoundSearchFoundGrant, CopyTokenSpec, CounterMoveStage, CounterPlacement, DrawEventStage,
+    EtbTapState, ProposedEvent, ReplacementId, SearchFoundDisposition,
 };
 use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
 
 use super::ability_utils::build_resolved_from_def;
+use super::arithmetic::u32_to_i32_saturating;
 use super::game_object::GameObject;
 
 // CR 122.1c shield-counter effects are intrinsic to counters, not stored
@@ -3282,7 +3283,7 @@ fn draw_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameState) ->
 }
 
 fn draw_applier(
-    event: ProposedEvent,
+    mut event: ProposedEvent,
     rid: ReplacementId,
     state: &mut GameState,
     _events: &mut Vec<GameEvent>,
@@ -3310,18 +3311,30 @@ fn draw_applier(
     // no-op (CR 614.6 — the replaced event never happens), and the substitute
     // runs via the `post_replacement_continuation` drain.
     if let Some(new_count) = draw_replacement_count(state, rid, &event) {
-        if let ProposedEvent::Draw {
-            player_id, applied, ..
-        } = event
-        {
-            return ApplyResult::Modified(ProposedEvent::Draw {
-                player_id,
-                count: new_count,
-                applied,
-            });
+        if let ProposedEvent::Draw { count, .. } = &mut event {
+            *count = new_count;
         }
     }
     ApplyResult::Modified(event)
+}
+
+/// CR 614.6 + CR 109.5: does a `Draw`-headed replacement draw for a player other
+/// than the one whose draw it replaces? "You" in a replacement is its
+/// controller, so a head drawing for the controller while an opponent draws
+/// (Alms Collector: "If an opponent would draw two or more cards, instead you
+/// and that player each draw a card") substitutes that draw — the opponent's
+/// draw never happens — rather than rescaling it. A head drawing for the drawer
+/// ("you draw two cards instead" on your own draw, or an event anaphor such as
+/// "they draw") is a count modification of the same draw.
+fn draw_head_draws_for_other_player(
+    head_recipient: &TargetFilter,
+    replacement_controller: PlayerId,
+    drawer: PlayerId,
+) -> bool {
+    matches!(
+        head_recipient,
+        TargetFilter::Controller | TargetFilter::OriginalController
+    ) && replacement_controller != drawer
 }
 
 fn draw_replacement_count(
@@ -3329,19 +3342,30 @@ fn draw_replacement_count(
     rid: ReplacementId,
     event: &ProposedEvent,
 ) -> Option<u32> {
-    let ProposedEvent::Draw { count, .. } = event else {
+    let ProposedEvent::Draw {
+        player_id, count, ..
+    } = event
+    else {
         return None;
     };
 
-    let execute = state
+    let repl_def = state
         .objects
         .get(&rid.source)?
         .replacement_definitions
-        .get(rid.index)?
-        .execute
-        .as_deref()?;
+        .get(rid.index)?;
+    let execute = repl_def.execute.as_deref()?;
 
     match &*execute.effect {
+        Effect::Draw { target, .. }
+            if draw_head_draws_for_other_player(
+                target,
+                replacement_ability_controller(state, rid, repl_def),
+                *player_id,
+            ) =>
+        {
+            None
+        }
         Effect::Draw { count: qty, .. } => {
             // CR 121.2 + CR 614.11a: "draw N cards instead" replacements
             // (Teferi's Ageless Insight: Fixed(2)) apply to each card draw
@@ -3360,8 +3384,9 @@ fn draw_replacement_count(
 }
 
 /// CR 614.6 + CR 614.11: does the branch being applied substitute the proposed
-/// draw with a NON-draw chain, so the original draw never happens and no
-/// `GameEvent::CardDrawn` is emitted?
+/// draw with a NON-draw chain — or with a draw for another player
+/// ([`draw_head_draws_for_other_player`]) — so the original draw never happens
+/// and no `GameEvent::CardDrawn` is emitted for it?
 ///
 /// `branch_ability` is the AST of the branch the pipeline is applying (`execute`
 /// on mandatory/accept, `decline` on decline), so an optional replacement's
@@ -3390,15 +3415,23 @@ fn draw_is_substituted_away(
     branch_ability: Option<&AbilityDefinition>,
     proposed: &ProposedEvent,
 ) -> bool {
-    if !matches!(proposed, ProposedEvent::Draw { .. }) {
+    let ProposedEvent::Draw { player_id, .. } = proposed else {
         return false;
-    }
+    };
     match branch_ability {
-        Some(def) => {
-            !matches!(*def.effect, Effect::Draw { .. })
-                && !EventModifiers::has_only_event_modifier(Some(def))
-                && draw_replacement_count(state, rid, proposed).is_none()
-        }
+        Some(def) => match &*def.effect {
+            // CR 614.6: a Draw head substitutes the draw only when it draws for
+            // another player (Alms Collector); otherwise it rescales it.
+            Effect::Draw { target, .. } => draw_head_draws_for_other_player(
+                target,
+                replacement_ability_controller(state, rid, repl_def),
+                *player_id,
+            ),
+            _ => {
+                !EventModifiers::has_only_event_modifier(Some(def))
+                    && draw_replacement_count(state, rid, proposed).is_none()
+            }
+        },
         None => repl_def.runtime_execute.as_deref().is_some_and(|runtime| {
             !matches!(runtime.effect, Effect::Draw { .. })
                 && !EventModifiers::is_event_modifier_effect(&runtime.effect)
@@ -3442,9 +3475,15 @@ fn scry_applier(
                 let new_count = resolve_event_replacement_quantity(qty, count)
                     .map(|resolved| resolved.max(0) as u32)
                     .unwrap_or(count);
+                // CR 121.2a: only a draw sequence mints instruction-stage events,
+                // so every one has a frame to settle into. This substitute stays at
+                // the individual stage it has always been consulted at here;
+                // `scry::apply_scry_after_replacement` hands its survivor to a draw
+                // sequence, which proposes the instruction.
                 ApplyResult::Modified(ProposedEvent::Draw {
                     player_id,
                     count: new_count,
+                    stage: DrawEventStage::Individual,
                     applied,
                 })
             }
@@ -6084,6 +6123,13 @@ fn replacement_condition_quantity_ctx(
             .and_then(|id| state.objects.get(&id))
             .map(replacement_source_player),
     };
+    // CR 121.2a: a count-form draw antecedent ("If an opponent would draw two or
+    // more cards") refers to the number of cards the proposed draw instruction
+    // draws — its `EventContextAmount` is this event's own count.
+    let event_amount = match event {
+        ProposedEvent::Draw { count, .. } => Some(u32_to_i32_saturating(*count)),
+        _ => None,
+    };
     crate::game::quantity::QuantityContext {
         entering: None,
         source: source_id,
@@ -6091,6 +6137,7 @@ fn replacement_condition_quantity_ctx(
         recipient: None,
         scoped_player,
         damage_source: None,
+        event_amount,
     }
 }
 
@@ -6882,6 +6929,49 @@ fn replacement_event_keys_for_event(event: &ProposedEvent) -> Vec<ReplacementEve
     keys
 }
 
+/// CR 121.2 + CR 121.2a: a `Draw` definition matches only the draw stage it
+/// watches — an `InstructionCount` definition the whole instruction, an
+/// `IndividualDraw` definition each individual draw. The stage is the event's
+/// own [`DrawEventStage`]; any printed threshold ("two or more cards") is the
+/// definition's `condition`, not this check. Non-draw events, and definitions
+/// without a draw scope, are not restricted here —
+/// `ReplacementDefinition::validate_draw_scope` owns the invariant that every
+/// `Draw` definition declares one.
+fn draw_scope_matches_event_stage(repl_def: &ReplacementDefinition, event: &ProposedEvent) -> bool {
+    let ProposedEvent::Draw { stage, .. } = event else {
+        return true;
+    };
+    draw_scope_admits_stage(repl_def.draw_scope, *stage)
+}
+
+fn draw_scope_admits_stage(scope: Option<DrawReplacementScope>, stage: DrawEventStage) -> bool {
+    match scope {
+        None => true,
+        Some(DrawReplacementScope::InstructionCount) => stage == DrawEventStage::Instruction,
+        Some(DrawReplacementScope::IndividualDraw) => stage == DrawEventStage::Individual,
+    }
+}
+
+/// CR 121.2a: could any replacement in the game apply to a draw instruction?
+/// A conservative superset of the candidate scan: every object-hosted `Draw`
+/// definition the pipeline's index is rebuilt from, and every floating one,
+/// that the stage matcher admits at the instruction stage — before player
+/// scope, conditions, or thresholds. When none does, proposing the instruction
+/// cannot change it, so the draw sequence skips that consult (and the index
+/// rebuild it costs) and owes the full count directly.
+pub(crate) fn draw_instruction_may_be_replaced(state: &GameState) -> bool {
+    let admits_instruction = |repl_def: &ReplacementDefinition| {
+        repl_def.event == ReplacementEvent::Draw
+            && draw_scope_admits_stage(repl_def.draw_scope, DrawEventStage::Instruction)
+    };
+    super::functioning_abilities::active_replacements(state)
+        .any(|(_, _, repl_def)| admits_instruction(repl_def))
+        || state
+            .pending_damage_replacements
+            .iter()
+            .any(admits_instruction)
+}
+
 fn object_replacement_candidate_applies(
     state: &GameState,
     event: &ProposedEvent,
@@ -7239,36 +7329,8 @@ fn object_replacement_candidate_applies(
             return false;
         }
     }
-    if let (Some(draw_scope), ProposedEvent::Draw { count, .. }) = (&repl_def.draw_scope, event) {
-        // CR 121.2a + CR 121.6b: a draw resolves in two seams and each shield is
-        // scoped to exactly one of them (`state.draw_consult_scope`). This is the
-        // seam that consumes the parsed threshold — sibling to `combat_scope` /
-        // `damage_target_filter` above.
-        match state.draw_consult_scope {
-            // Pre-split whole-instruction consult: ONLY a count-form
-            // ("would draw N or more cards") shield hooks the instruction, and
-            // only when it draws at least its printed threshold N. An
-            // IndividualDraw shield (Dredge, Notion Thief) must wait for its
-            // individual card below.
-            crate::types::ability::DrawConsultScope::Instruction => match draw_scope {
-                DrawReplacementScope::InstructionCount { min } if count >= min => {}
-                _ => return false,
-            },
-            // Per-card / non-split consult: an IndividualDraw shield hooks each
-            // card; a count-form shield hooks a non-split whole-count draw (the
-            // turn-based draw step, connive, gift) at/above threshold. On the
-            // split path the count-form shield already fired at the instruction
-            // seam and is guarded here by the `applied` set (CR 614.5).
-            crate::types::ability::DrawConsultScope::Individual => {
-                if let DrawReplacementScope::InstructionCount { min } = draw_scope {
-                    // CR 121.2a: a sub-threshold instruction (e.g. a single-card
-                    // draw against Alms Collector's "two or more") is untouched.
-                    if count < min {
-                        return false;
-                    }
-                }
-            }
-        }
+    if !draw_scope_matches_event_stage(repl_def, event) {
+        return false;
     }
     if let ProposedEvent::AddCounter { placement, .. } = event {
         // CR 614.1a: `valid_player` is a *relative* scope; the subject axis selects
@@ -7950,6 +8012,9 @@ pub fn find_applicable_replacements(
                     // it).
                     let source_controller =
                         repl_def.source_controller.unwrap_or(state.active_player);
+                    if !draw_scope_matches_event_stage(repl_def, event) {
+                        continue;
+                    }
                     // CR 614.1a: Draw replacements hosted in pending state
                     // (Words of Worship/Wilding) scope by the installing player
                     // captured at resolution, not the source permanent's live
@@ -8217,7 +8282,9 @@ pub(crate) fn event_is_accounted(event: &ProposedEvent) -> bool {
         // guard: the shield-damage virtual candidate is drawn under `amount > 0`.
         ProposedEvent::Damage { amount, .. } => *amount > 0,
         // CR 121.1: DELEGATES every card to `zone_pipeline::move_object`, but
-        // keeps `player.cards_drawn_this_turn`.
+        // keeps `player.cards_drawn_this_turn`. CR 121.2a: an instruction-stage
+        // event writes that ledger through the individual draws it is split
+        // into, so both stages are accounted.
         ProposedEvent::Draw { count, .. } => *count > 0,
         // ---- unaccounted: no axis of its own ⇒ the probe refuses. Named, not
         //      wildcarded, so a new variant is a compile error here. ----
@@ -8397,6 +8464,7 @@ fn extract_etb_counters_from_effect(
                 recipient: None,
                 scoped_player: None,
                 damage_source: None,
+                event_amount: None,
             };
             let n = match count {
                 QuantityExpr::Fixed { value } => (*value).max(0) as u32,
@@ -8430,6 +8498,7 @@ fn extract_etb_counters_from_effect(
                     recipient: None,
                     scoped_player: None,
                     damage_source: None,
+                    event_amount: None,
                 };
                 let n =
                     crate::game::quantity::resolve_quantity_with_ctx(state, count, controller, ctx)
@@ -9052,6 +9121,12 @@ fn apply_single_replacement(
                         return true;
                     };
                     if def.sub_ability.is_some() {
+                        return true;
+                    }
+                    // CR 614.6: a draw for another player was not folded into the
+                    // replaced draw (it was zeroed above), so the continuation is
+                    // the whole substitute.
+                    if draw_is_substituted_away(state, rid, repl_def, ability, &proposed) {
                         return true;
                     }
                     !matches!(
@@ -10411,142 +10486,6 @@ pub fn replace_event(
     result
 }
 
-/// Result of consulting count-form replacements against a whole draw
-/// instruction (CR 121.2a). See [`replace_draw_instruction`].
-pub(crate) enum DrawInstructionOutcome {
-    /// No instruction-scoped shield fired (or one only modified the count). The
-    /// instruction proceeds to its individual card draws with this surviving
-    /// count and applied set.
-    Proceed {
-        count: u32,
-        applied: HashSet<AppliedReplacementKey>,
-    },
-    /// A count-form shield fully substituted or prevented the instruction (its
-    /// substitute, if any, has already been drained in this resolution step).
-    /// No individual draws follow; the carried result is the caller's return.
-    Replaced(ReplacementResult),
-}
-
-/// True when any functioning permanent carries a count-form
-/// (`InstructionCount`) draw replacement. A cheap early-out so ordinary draws —
-/// the overwhelming majority, with no Alms-Collector-class shield anywhere —
-/// keep their exact prior per-card path with zero extra pipeline work.
-///
-/// Enumerates through the same `functioning_abilities::active_replacements`
-/// iterator the authoritative matcher uses, so the gate respects functioning
-/// status (CR 614.1) and can neither under-count (a false negative would silently
-/// skip a live shield) nor spuriously fire on a non-functioning definition.
-fn any_instruction_count_draw_shield(state: &GameState) -> bool {
-    super::functioning_abilities::active_replacements(state).any(|(_, _, def)| {
-        matches!(def.event, ReplacementEvent::Draw)
-            && matches!(
-                def.draw_scope,
-                Some(DrawReplacementScope::InstructionCount { .. })
-            )
-    })
-}
-
-/// CR 121.2a: Consult count-form ("If [a player] would draw N or more cards,
-/// ...") draw replacements against a whole draw instruction BEFORE it splits
-/// into individual card draws. A count-form antecedent modifies the instruction
-/// "before considering any of the individual card draws", so the per-card seam
-/// (which only ever sees `count == 1`) can never enforce a threshold of two or
-/// more — this is the only seam that can.
-///
-/// Only `InstructionCount`-scoped shields are eligible here (via
-/// `state.draw_consult_scope`); an `IndividualDraw` shield still hooks each card
-/// downstream. A single mandatory count-form shield resolves synchronously (no
-/// CR 616 ordering choice, no optional yes/no); anything else — two competing
-/// count-form shields on one instruction, or an optional one — has no printed
-/// exemplar and is deferred to the per-card seam rather than mis-order a pause
-/// whose resume this seam does not model.
-pub(crate) fn replace_draw_instruction(
-    state: &mut GameState,
-    player: PlayerId,
-    count: u32,
-    applied: HashSet<AppliedReplacementKey>,
-    events: &mut Vec<GameEvent>,
-) -> DrawInstructionOutcome {
-    use crate::types::ability::DrawConsultScope;
-
-    // Fast path: no count-form shield exists, so the instruction seam is inert.
-    if count == 0 || !any_instruction_count_draw_shield(state) {
-        return DrawInstructionOutcome::Proceed { count, applied };
-    }
-
-    let registry = replacement_registry();
-    let instruction = ProposedEvent::Draw {
-        player_id: player,
-        count,
-        applied: applied.clone(),
-    };
-
-    // Enter the pre-split seam so only count-form shields match (CR 121.2a).
-    let prev_scope = state.draw_consult_scope;
-    state.draw_consult_scope = DrawConsultScope::Instruction;
-
-    let candidates = find_applicable_replacements(state, &instruction, registry);
-    // CR 616.1 + CR 614.13: a single mandatory shield is the only synchronous
-    // shape. Look the definition up mirroring `apply_single_replacement`'s source
-    // resolution (object or liminal entry).
-    let single_mandatory = candidates.len() == 1 && {
-        let rid = candidates[0];
-        state
-            .objects
-            .get(&rid.source)
-            .or_else(|| state.liminal_entries.get(&rid.source).map(|e| &e.object))
-            .and_then(|obj| obj.replacement_definitions.get(rid.index))
-            .is_some_and(|def| matches!(def.mode, ReplacementMode::Mandatory))
-    };
-
-    if !single_mandatory {
-        // strict-failure: CR 121.2a competing/optional instruction-count draw
-        // replacements need a player-ordering or yes/no choice at the pre-split
-        // seam — no printed card exercises it. Proceed unreplaced; a `count == 0`
-        // candidate scan that matched nothing lands here too.
-        state.draw_consult_scope = prev_scope;
-        return DrawInstructionOutcome::Proceed { count, applied };
-    }
-
-    let result = replace_event(state, instruction, events);
-    // CR 614.6 + CR 121.6: a full substitution (Alms Collector: "instead you and
-    // that player each draw a card") is pre-zeroed by `apply_single_replacement`
-    // and its substitute stashed as a post-replacement continuation. Drain it in
-    // the same resolution step, mirroring `draw_through_replacement`'s Execute
-    // arm, so the substitute runs before the (now zero-count) instruction below.
-    if !matches!(result, ReplacementResult::NeedsChoice(_)) && state.has_post_replacement_drain() {
-        let _ = crate::game::engine_replacement::apply_pending_post_replacement_effect(
-            state, None, None, None, events,
-        );
-    }
-    state.draw_consult_scope = prev_scope;
-
-    match result {
-        // CR 614.11a: a count modifier (Alhammarret's Archive-class instruction
-        // shield) leaves a nonzero survivor — proceed with the modified count,
-        // carrying the fired shield in `applied` so the per-card seam does not
-        // re-offer it (CR 614.5).
-        ReplacementResult::Execute(ProposedEvent::Draw {
-            count: surviving,
-            applied: surviving_applied,
-            ..
-        }) => DrawInstructionOutcome::Proceed {
-            count: surviving,
-            applied: surviving_applied,
-        },
-        ReplacementResult::Execute(other) => {
-            debug_assert!(
-                false,
-                "draw instruction consult produced a non-Draw survivor: {other:?}"
-            );
-            DrawInstructionOutcome::Proceed { count, applied }
-        }
-        result @ (ReplacementResult::Prevented | ReplacementResult::NeedsChoice(_)) => {
-            DrawInstructionOutcome::Replaced(result)
-        }
-    }
-}
-
 /// CR 510.2 + CR 615.7 + CR 615.13: Run the replacement pipeline over a whole
 /// simultaneous combat-damage batch.
 ///
@@ -10698,6 +10637,7 @@ fn continue_replacement_impl(
             return ReplacementResult::Execute(ProposedEvent::Draw {
                 player_id: PlayerId(0),
                 count: 0,
+                stage: DrawEventStage::Individual,
                 applied: std::collections::HashSet::new(),
             });
         }
@@ -11924,6 +11864,7 @@ mod tests {
             ProposedEvent::Draw {
                 player_id: PlayerId(0),
                 count: 1,
+                stage: DrawEventStage::Individual,
                 applied: HashSet::new(),
             },
             &mut events,
@@ -12214,6 +12155,7 @@ mod tests {
                 ProposedEvent::Draw {
                     player_id: PlayerId(0),
                     count: 1,
+                    stage: DrawEventStage::Individual,
                     applied: HashSet::new(),
                 },
                 vec![ReplacementEvent::Draw],
@@ -14046,6 +13988,7 @@ mod tests {
         let proposed = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 3,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
 
@@ -14188,6 +14131,125 @@ mod tests {
         assert!(find_applicable_replacements(&state, &opponent_event, &registry).is_empty());
     }
 
+    #[test]
+    fn draw_scope_matches_only_its_stage_and_threshold_reads_the_event_count() {
+        // CR 121.2 + CR 121.2a: an instruction-scoped definition is a candidate
+        // only for the draw instruction and an individual-draw definition only
+        // for an individual draw; a count-form threshold is the definition's own
+        // `OnlyIfQuantity` over the proposed event's count.
+        let mut count_form = ReplacementDefinition::new(ReplacementEvent::Draw)
+            .draw_scope(DrawReplacementScope::InstructionCount)
+            .condition(ReplacementCondition::OnlyIfQuantity {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 2 },
+                active_player_req: None,
+            })
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::OriginalController,
+                },
+            ));
+        count_form.valid_player = Some(ReplacementPlayerScope::Opponent);
+        let individual = ReplacementDefinition::new(ReplacementEvent::Draw)
+            .draw_scope(DrawReplacementScope::IndividualDraw)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+        let mut state = test_state_with_object(ObjectId(10), Zone::Battlefield, vec![count_form]);
+        let mut individual_source = GameObject::new(
+            ObjectId(11),
+            CardId(2),
+            PlayerId(1),
+            "Individual".to_string(),
+            Zone::Battlefield,
+        );
+        individual_source.replacement_definitions = vec![individual].into();
+        state.objects.insert(ObjectId(11), individual_source);
+        state.battlefield.push_back(ObjectId(11));
+        let registry = build_replacement_registry();
+        let opponent_draw = |count, stage| ProposedEvent::Draw {
+            player_id: PlayerId(1),
+            count,
+            stage,
+            applied: HashSet::new(),
+        };
+        let sources = |event: &ProposedEvent| -> Vec<ObjectId> {
+            find_applicable_replacements(&state, event, &registry)
+                .into_iter()
+                .map(|rid| rid.source)
+                .collect()
+        };
+
+        assert_eq!(
+            sources(&opponent_draw(2, DrawEventStage::Instruction)),
+            vec![ObjectId(10)],
+            "a two-card instruction meets the threshold; the individual-draw \
+             replacement is not consulted for an instruction"
+        );
+        assert!(
+            sources(&opponent_draw(1, DrawEventStage::Instruction)).is_empty(),
+            "a one-card instruction is below the count-form threshold"
+        );
+        assert_eq!(
+            sources(&opponent_draw(2, DrawEventStage::Individual)),
+            vec![ObjectId(11)],
+            "only the individual-draw replacement is consulted for an individual draw"
+        );
+    }
+
+    #[test]
+    fn draw_instruction_may_be_replaced_only_with_an_instruction_scoped_definition() {
+        // CR 121.2a: the draw sequence skips the instruction consult only when no
+        // object-hosted or floating definition is admitted at the instruction stage.
+        let draw_def = |scope| {
+            ReplacementDefinition::new(ReplacementEvent::Draw)
+                .draw_scope(scope)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 2 },
+                        target: TargetFilter::Controller,
+                    },
+                ))
+        };
+
+        let mut state = test_state_with_object(
+            ObjectId(10),
+            Zone::Battlefield,
+            vec![draw_def(DrawReplacementScope::IndividualDraw)],
+        );
+        assert!(
+            !draw_instruction_may_be_replaced(&state),
+            "an individual-draw definition cannot replace an instruction"
+        );
+        state
+            .pending_damage_replacements
+            .push(draw_def(DrawReplacementScope::InstructionCount));
+        assert!(
+            draw_instruction_may_be_replaced(&state),
+            "a floating instruction-scoped definition must keep the consult"
+        );
+
+        let object_hosted = test_state_with_object(
+            ObjectId(10),
+            Zone::Battlefield,
+            vec![draw_def(DrawReplacementScope::InstructionCount)],
+        );
+        assert!(
+            draw_instruction_may_be_replaced(&object_hosted),
+            "an object-hosted instruction-scoped definition must keep the consult"
+        );
+    }
+
     // CR 702.52a: a Dredge draw-replacement shaped like `synthesize_dredge`'s.
     fn dredge_draw_replacement_def() -> ReplacementDefinition {
         let return_to_hand = AbilityDefinition::new(
@@ -14270,6 +14332,7 @@ mod tests {
         let owner_draw = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         assert_eq!(
@@ -14282,6 +14345,7 @@ mod tests {
         let opponent_draw = ProposedEvent::Draw {
             player_id: PlayerId(1),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         assert!(
@@ -14298,6 +14362,7 @@ mod tests {
         let owner_draw = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         assert!(
@@ -14318,6 +14383,7 @@ mod tests {
         let owner_draw = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         assert_eq!(
@@ -14329,207 +14395,12 @@ mod tests {
         let stale_controller_draw = ProposedEvent::Draw {
             player_id: PlayerId(1),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         assert!(
             find_applicable_replacements(&state, &stale_controller_draw, &registry).is_empty(),
             "dredge must not follow the card's stale battlefield controller"
-        );
-    }
-
-    /// Alms Collector — "If an opponent would draw two or more cards, instead you
-    /// and that player each draw a card." A count-form antecedent with threshold
-    /// N=2 (`DrawReplacementScope::InstructionCount { min: 2 }`).
-    fn alms_collector_draw_replacement_def() -> ReplacementDefinition {
-        // CR 614.6 + CR 121.2a: the substitute draws a fixed card each — its
-        // shape is irrelevant to applicability, which turns on scope + threshold.
-        let substitute = AbilityDefinition::new(
-            crate::types::ability::AbilityKind::Spell,
-            Effect::Draw {
-                count: QuantityExpr::Fixed { value: 1 },
-                target: TargetFilter::Controller,
-            },
-        );
-        let mut repl = ReplacementDefinition::new(ReplacementEvent::Draw)
-            .draw_scope(DrawReplacementScope::InstructionCount { min: 2 });
-        // CR 614.1a: "an opponent would draw" scopes the shield to opponents of
-        // Alms Collector's controller (PlayerId(0)).
-        repl.valid_player = Some(crate::types::ability::ReplacementPlayerScope::Opponent);
-        repl.execute = Some(Box::new(substitute));
-        repl
-    }
-
-    /// CR 121.2a: a count-form "two or more" antecedent modifies the draw
-    /// *instruction*, and only when it draws at least N=2 cards. The parsed
-    /// threshold must reach the matcher: a single-card opponent draw slips past
-    /// the shield, a two-card opponent draw is caught. This is the runtime proof
-    /// the reviewer required — the parser retaining `min` is inert unless the
-    /// applicability seam consumes it.
-    #[test]
-    fn alms_collector_threshold_gates_draw_replacement_by_count() {
-        let mut state = test_state_with_object(
-            ObjectId(20),
-            Zone::Battlefield,
-            vec![alms_collector_draw_replacement_def()],
-        );
-        // Alms Collector is controlled by PlayerId(0); PlayerId(1) is the opponent.
-        state.objects.get_mut(&ObjectId(20)).unwrap().controller = PlayerId(0);
-        let registry = build_replacement_registry();
-
-        // Opponent draws ONE card: below the "two or more" threshold — untouched.
-        let opponent_draws_one = ProposedEvent::Draw {
-            player_id: PlayerId(1),
-            count: 1,
-            applied: HashSet::new(),
-        };
-        assert!(
-            find_applicable_replacements(&state, &opponent_draws_one, &registry).is_empty(),
-            "CR 121.2a: a one-card opponent draw is below Alms Collector's N=2 threshold \
-             and must NOT be replaced"
-        );
-
-        // Opponent draws TWO cards: meets the threshold — the shield applies.
-        let opponent_draws_two = ProposedEvent::Draw {
-            player_id: PlayerId(1),
-            count: 2,
-            applied: HashSet::new(),
-        };
-        assert_eq!(
-            find_applicable_replacements(&state, &opponent_draws_two, &registry).len(),
-            1,
-            "CR 121.2a: a two-card opponent draw meets the N=2 threshold and must be replaced"
-        );
-
-        // CR 614.1a: even a threshold-meeting draw by the controller is out of
-        // scope — the antecedent is opponent-only.
-        let controller_draws_two = ProposedEvent::Draw {
-            player_id: PlayerId(0),
-            count: 2,
-            applied: HashSet::new(),
-        };
-        assert!(
-            find_applicable_replacements(&state, &controller_draws_two, &registry).is_empty(),
-            "CR 614.1a: Alms Collector's opponent-scoped shield must not apply to its \
-             controller's own draw"
-        );
-    }
-
-    /// An Alms-Collector-class count-form shield whose substitute is a clean
-    /// full replacement (here a life gain) so the observable outcome is
-    /// deterministic: when it fires, the original draw is pre-zeroed (CR 614.6)
-    /// and the substitute runs instead. Opponent-scoped, threshold N=2.
-    fn alms_class_full_substitution_shield() -> ReplacementDefinition {
-        let substitute = AbilityDefinition::new(
-            crate::types::ability::AbilityKind::Spell,
-            Effect::GainLife {
-                amount: QuantityExpr::Fixed { value: 3 },
-                player: TargetFilter::Controller,
-            },
-        );
-        let mut repl = ReplacementDefinition::new(ReplacementEvent::Draw)
-            .draw_scope(DrawReplacementScope::InstructionCount { min: 2 });
-        repl.valid_player = Some(crate::types::ability::ReplacementPlayerScope::Opponent);
-        repl.execute = Some(Box::new(substitute));
-        repl
-    }
-
-    fn seed_library(state: &mut GameState, player_index: usize, size: usize) {
-        let base = 200 + (player_index as u64) * 100;
-        let owner = state.players[player_index].id;
-        let lib = &mut state.players[player_index].library;
-        lib.clear();
-        let mut ids = Vec::new();
-        for i in 0..size as u64 {
-            let object_id = ObjectId(base + i);
-            lib.push_back(object_id);
-            ids.push((object_id, i));
-        }
-        for (object_id, i) in ids {
-            state.objects.insert(
-                object_id,
-                GameObject::new(
-                    object_id,
-                    CardId(base + i),
-                    owner,
-                    format!("Library Card {i}"),
-                    Zone::Library,
-                ),
-            );
-        }
-    }
-
-    /// CR 121.2a end-to-end: the count-form threshold is enforced at the
-    /// pre-split draw-instruction seam, driving the real production path
-    /// (`start_draw_sequence` → `replace_draw_instruction`). A one-card opponent
-    /// draw is below the "two or more" threshold and resolves normally; a
-    /// two-card opponent draw meets it and is fully replaced (opponent draws
-    /// nothing, the substitute runs) — the split into per-unit `count == 1`
-    /// draws can never see the threshold, so this proves the seam, not just the
-    /// isolated matcher.
-    #[test]
-    fn alms_class_replaces_instruction_at_pre_split_seam() {
-        use crate::game::effects::draw::start_draw_sequence;
-
-        // --- Control: opponent draws ONE card → below threshold, not replaced.
-        let mut state = test_state_with_object(
-            ObjectId(20),
-            Zone::Battlefield,
-            vec![alms_class_full_substitution_shield()],
-        );
-        state.objects.get_mut(&ObjectId(20)).unwrap().controller = PlayerId(0);
-        seed_library(&mut state, 1, 4);
-        let controller_life_before = state.players[0].life;
-        let opponent_hand_before = state.players[1].hand.len();
-        let mut events = Vec::new();
-
-        let result = start_draw_sequence(&mut state, PlayerId(1), 1, &mut events);
-        assert!(
-            matches!(result, ReplacementResult::Execute(_)),
-            "a one-card draw resolves without pausing, got {result:?}"
-        );
-        assert_eq!(
-            state.players[1].hand.len(),
-            opponent_hand_before + 1,
-            "CR 121.2a: a one-card opponent draw is below the N=2 threshold and must draw normally"
-        );
-        assert_eq!(
-            state.players[0].life, controller_life_before,
-            "the sub-threshold draw must not fire the shield's substitute"
-        );
-
-        // --- Fire: opponent draws TWO cards → meets threshold, replaced whole.
-        let mut state = test_state_with_object(
-            ObjectId(20),
-            Zone::Battlefield,
-            vec![alms_class_full_substitution_shield()],
-        );
-        state.objects.get_mut(&ObjectId(20)).unwrap().controller = PlayerId(0);
-        seed_library(&mut state, 1, 4);
-        let controller_life_before = state.players[0].life;
-        let opponent_hand_before = state.players[1].hand.len();
-        let mut events = Vec::new();
-
-        let result = start_draw_sequence(&mut state, PlayerId(1), 2, &mut events);
-        assert!(
-            matches!(result, ReplacementResult::Execute(_)),
-            "the mandatory instruction-scoped shield resolves synchronously, got {result:?}"
-        );
-        assert_eq!(
-            state.players[1].hand.len(),
-            opponent_hand_before,
-            "CR 121.2a + CR 614.6: the two-card draw is fully replaced — the opponent draws \
-             nothing (the original instruction is pre-zeroed)"
-        );
-        assert_eq!(
-            state.players[0].life,
-            controller_life_before + 3,
-            "the substitute (a life gain, standing in for Alms Collector's 'you and that player \
-             each draw a card') runs in place of the replaced instruction"
-        );
-        assert!(
-            state.draw_sequences.is_empty(),
-            "the replaced instruction leaves no draw frame parked, got {:?}",
-            state.draw_sequences
         );
     }
 
@@ -14681,6 +14552,7 @@ mod tests {
             ProposedEvent::Draw {
                 player_id: PlayerId(0),
                 count: 1,
+                stage: DrawEventStage::Individual,
                 applied: HashSet::new(),
             },
             &mut events,
@@ -14714,6 +14586,7 @@ mod tests {
             ProposedEvent::Draw {
                 player_id: PlayerId(1),
                 count: 1,
+                stage: DrawEventStage::Individual,
                 applied: HashSet::new(),
             },
             &mut events,
@@ -14735,6 +14608,7 @@ mod tests {
             ProposedEvent::Draw {
                 player_id: PlayerId(0),
                 count: 1,
+                stage: DrawEventStage::Individual,
                 applied: HashSet::new(),
             },
             &mut events,
@@ -14865,6 +14739,7 @@ mod tests {
         let proposed = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 3,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
 
@@ -14897,6 +14772,7 @@ mod tests {
         let proposed = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 0,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         let registry = build_replacement_registry();
@@ -18270,6 +18146,7 @@ mod tests {
         let proposed = ProposedEvent::Draw {
             player_id: PlayerId(1),
             count: 2,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         let registry = build_replacement_registry();
@@ -18465,6 +18342,7 @@ mod tests {
         let draw = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         assert!(begin_turn_matcher(&begin_turn, ObjectId(1), &state));
@@ -19421,6 +19299,7 @@ mod tests {
         let proposed = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         let registry = build_replacement_registry();
@@ -20564,6 +20443,7 @@ mod tests {
         let draw_event = |player_id: PlayerId| ProposedEvent::Draw {
             player_id,
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
 
@@ -21064,6 +20944,7 @@ mod tests {
         let draw_event = |player_id: PlayerId| ProposedEvent::Draw {
             player_id,
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
 
@@ -21126,6 +21007,7 @@ mod tests {
         let draw = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         let mut events = Vec::new();
@@ -21165,6 +21047,7 @@ mod tests {
         let draw = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         let mut events = Vec::new();
@@ -21221,6 +21104,7 @@ mod tests {
         let draw = ProposedEvent::Draw {
             player_id: PlayerId(0),
             count: 1,
+            stage: DrawEventStage::Individual,
             applied: HashSet::new(),
         };
         let mut events = Vec::new();

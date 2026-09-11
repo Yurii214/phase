@@ -17360,13 +17360,6 @@ impl<'de> Deserialize<'de> for PendingLiminalEntryResume {
     }
 }
 
-/// serde skip predicate for [`GameState::draw_consult_scope`] — the transient
-/// consult scope is only ever `Instruction` mid-consult, which never spans a
-/// serialization boundary, so the `Individual` default is elided.
-fn draw_consult_scope_is_individual(scope: &crate::types::ability::DrawConsultScope) -> bool {
-    matches!(scope, crate::types::ability::DrawConsultScope::Individual)
-}
-
 /// CR 104.4b + CR 732.2a: ONE retained loop-detection sample, with its two roles
 /// separated at the type level.
 ///
@@ -17700,13 +17693,6 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_replacement_token_substitution_count: Option<i32>,
 
-    /// CR 121.2a: which draw-replacement scope the in-progress replacement
-    /// consult is eligible to match. See [`DrawConsultScope`]. Transient — set to
-    /// `Instruction` only for the duration of the pre-split whole-instruction
-    /// consult in `game::replacement::replace_draw_instruction`, and restored to
-    /// the `Individual` default (skipped by serde) immediately afterward.
-    #[serde(default, skip_serializing_if = "draw_consult_scope_is_individual")]
-    pub draw_consult_scope: crate::types::ability::DrawConsultScope,
     /// CR 614.12a + CR 707.9 + CR 603.2: `ZoneChanged`-to-battlefield events
     /// for an object whose entry is paused mid-resolution awaiting an
     /// interactive choice (e.g. `WaitingFor::CopyTargetChoice`). Per CR
@@ -24193,7 +24179,6 @@ impl GameState {
             replacement_may_cost_paused: false,
             post_replacement_token_choice_applied: None,
             post_replacement_token_substitution_count: None,
-            draw_consult_scope: crate::types::ability::DrawConsultScope::Individual,
             deferred_entry_events: Vec::new(),
             pending_token_battlefield_entry: None,
             layers_dirty: LayersDirty::full(),
@@ -26315,7 +26300,6 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_combat_lifelink: _,
         replacement_may_cost_paused: _,
         post_replacement_token_choice_applied: _,
-        draw_consult_scope: _,
         deferred_entry_events: _,
         pending_token_battlefield_entry: _,
         layers_dirty: _,

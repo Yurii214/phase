@@ -28396,10 +28396,11 @@ pub enum CombatDamageScope {
 /// corpus by `scripts/draw_replacement_census.py`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrawReplacementScope {
-    /// Modifies the draw *instruction*'s count before any individual draw happens
-    /// (CR 121.2a). Quantum Riddler — "if you would draw one or more cards, you
-    /// draw that many cards plus one instead" — is the only card in the pool that
-    /// does this.
+    /// Applies to the draw *instruction* before any individual draw happens
+    /// (CR 121.2a): it modifies the instruction's count (Quantum Riddler — "if you
+    /// would draw one or more cards, you draw that many cards plus one instead") or,
+    /// behind a count-form threshold, replaces it (Alms Collector — "If an opponent
+    /// would draw two or more cards, instead you and that player each draw a card").
     InstructionCount,
     /// Replaces or prevents a single individual card draw (CR 121.6b). Dredge,
     /// Notion Thief, Hullbreacher, and the runtime "you can't draw" shields.
@@ -28416,30 +28417,6 @@ pub enum PlaneswalkReplacementScope {
     Any,
     /// CR 901.9c: Only planeswalks from the planar die's Planeswalker symbol.
     PlanarDieOnly,
-}
-
-/// CR 121.2a + CR 121.6b: which [`DrawReplacementScope`] the in-progress draw
-/// replacement consult is eligible to match. A draw instruction resolves in two
-/// seams — the whole-instruction consult that runs *before* the instruction
-/// splits into individual card draws, and the per-card consult that runs for
-/// each individual draw — and a shield is scoped to exactly one of them.
-///
-/// The default, [`Individual`](Self::Individual), is the per-card seam: an
-/// `IndividualDraw` shield hooks each card, and a count-form
-/// `InstructionCount` shield hooks a non-split whole-count draw (the turn-based
-/// draw step, connive, gift) at or above its printed threshold.
-/// [`Instruction`](Self::Instruction) is set only by
-/// `game::replacement::replace_draw_instruction` for the pre-split consult, so
-/// only `InstructionCount` shields see the whole instruction there — an
-/// `IndividualDraw` shield must wait for its individual card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum DrawConsultScope {
-    /// The per-card / non-split draw seam. See the type-level docs.
-    #[default]
-    Individual,
-    /// The pre-split whole-instruction seam (CR 121.2a). Only `InstructionCount`
-    /// count-form shields are eligible.
-    Instruction,
 }
 
 /// CR 614.1a: Which player(s) a replacement effect applies to, scoped relative
